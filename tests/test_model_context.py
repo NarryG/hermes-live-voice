@@ -96,7 +96,7 @@ def test_constructed_voice_prompts(profile, allow_chat, language):
         _DIRECTIVE_PATH=REPO / 'language_directive.txt',
         _bot_display_name=lambda _: 'Example Bot',
         _host_bot_name=lambda: 'Host Bot',
-        talk_auth=SimpleNamespace(resolve_auth=lambda: SimpleNamespace(token='stub')),
+        talk_auth=SimpleNamespace(resolve_auth=lambda: SimpleNamespace(token='stub', source='env')),
         talk_config=SimpleNamespace(talk_model=lambda: 'stub'),
         talk_wire=SimpleNamespace(mint_ephemeral_session=lambda **kw: captured.update(kw)),
     )

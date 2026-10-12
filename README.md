@@ -3,7 +3,7 @@
 Native **full-duplex voice** for [Hermes](https://github.com/NousResearch/hermes-agent) — talk to your
 bots from Hermes Desktop with real-time audio, live transcript, voice tool calls and task delegation.
 
-**Engine:** [GPT-Live-1](https://openai.com/index/introducing-gpt-live-1-in-the-api/) (`gpt-live-1-codex`)
+**Desktop engine:** [GPT-Live-1](https://openai.com/index/introducing-gpt-live-1-in-the-api/) (`gpt-live-1-codex`)
 through the local **Codex app-server**, running on a **ChatGPT/Codex subscription** — no API key needed
 for the voice lane.
 
@@ -22,7 +22,7 @@ These changes are regression-tested without provider calls or microphones. A suc
 
 [![CI](https://github.com/NarryG/hermes-live-voice/actions/workflows/ci.yml/badge.svg)](https://github.com/NarryG/hermes-live-voice/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.2.6%2Bbuffer.1-informational)](plugin.yaml)
+[![Version](https://img.shields.io/badge/version-0.3.0%2Bbuffer.1-informational)](plugin.yaml)
 [![Status: preview](https://img.shields.io/badge/status-preview-orange)](#status--roadmap)
 
 [![Live Voice demo: a spoken request is delegated to the open chat and the answer is read back](docs/media/live-voice-demo.gif)](docs/media/live-voice-demo.mp4)
@@ -31,7 +31,24 @@ These changes are regression-tested without provider calls or microphones. A suc
 
 ---
 
+## Discord voice calls
+
+The native `/livevoice` command is wired to an owning-host selected-CLI metadata
+adapter, token-opaque subscription broker and **direct V3 WebRTC**, not app-server
+voice or a backing agent. Offline integrated tests exercise one-to-one and consented
+group calls with the existing Discord SDK/native command, localhost HTTP and real
+local Opus RTP peers. **This is an offline-exercised preview, not a live entitlement
+or playback certification.** Initial support is the registered hosting/default
+adapter and native file credentials only; unsupported account/config/store/routing
+scopes refuse before join/provider effects. Normal selected CLI cache/loading and
+existing-login renewal are admitted only after command disclosure/opt-in. No new
+login/account/provider/model selection, API fallback, automatic task executor,
+private Desktop attachment or DM ringing occurs. See [scope, controls, dependencies
+and installation/review gates](docs/discord.md).
+
 ## Contents
+
+- [Discord voice calls](docs/discord.md)
 
 - [Features](#features)
 - [Requirements](#requirements)
@@ -70,7 +87,11 @@ These changes are regression-tested without provider calls or microphones. A suc
 ## Requirements
 
 - **Hermes Agent** (backend) and **Hermes Desktop** (app).
-- **`codex` CLI ≥ 0.154**, logged in with a ChatGPT plan (`codex login` — device auth).
+- **Desktop:** `codex` CLI ≥ 0.154 with the user's own authorized ChatGPT login.
+- **Discord preview:** pinned Codex **0.162.1**, an already-selected login and the
+  existing native Discord host APIs/receiver. Dependencies are declared in
+  `pyproject.toml` (Discord.py 2.7.1 voice extras, aiortc 1.15.0, PyAV 17.1.0,
+  aiohttp 3.x); no second bot/client is created.
 - Python 3.11+ for the backend half.
 
 ## Install
@@ -189,7 +210,10 @@ full [`hermes-talk`](https://github.com/TheSmokeDev/hermes-talk) plugin when it 
 — native voice tools, run steering, cascade modes), otherwise the MIT-licensed fallback bundled in
 `dashboard/talk_vendor/`, so a fresh install with no other plugin mounts correctly (covered by a
 regression test that runs with an empty `HOME` and no `hermes-talk` present). Runtime dependencies
-are the Hermes dashboard's own (`fastapi`, `httpx`); the desktop half has no build step. The complete
+for Desktop use the Hermes dashboard's own (`fastapi`, `httpx`); the desktop half has no build step.
+Discord's additional media dependencies come from `pyproject.toml`. Its adapter and
+media path are integrated and exercised offline, but independent review, a pinned
+publication and separate-agent installation/live-channel validation remain gates. The complete
 Live Voice implementation and the protocol documentation are included here for reference and
 integration work.
 
@@ -204,11 +228,16 @@ integration work.
 ## Tests
 
 ```bash
+python -m pip install '.[test]'
 python -m pytest -q
 ```
 
 Regression tests for the audit findings in issue #1 (no network, no `codex` binary, no OpenAI
-calls — stdlib + pytest only). CI additionally verifies the bundled fallback imports on a
+calls). Discord regressions use only a fixed labelled local metadata child,
+synthetic native/HTTP boundaries and real local aiortc peers with no STUN. No real
+CLI credential/config loading, provider, Discord channel or microphone is tested.
+CI installs dependencies from the same pyproject the native plugin installer reads,
+and additionally verifies the bundled fallback imports on a
 clean environment (empty `HOME`, no site-packages), compiles the backend, syntax-checks the
 desktop half and runs the ESM load harness.
 
@@ -226,5 +255,7 @@ and the reproduction script behind the 0.2.1 fixes.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Codex and GPT are OpenAI products; this project is **not affiliated
+MIT for the plugin, with an Apache-2.0-derived reduced Codex schema key list — see
+[LICENSE](LICENSE), [NOTICE.md](NOTICE.md) and [Codex licence](licenses/Codex-Apache-2.0.txt).
+Codex and GPT are OpenAI products; this project is **not affiliated
 with or endorsed by OpenAI**. The Codex CLI it drives is open source and installed by the user.

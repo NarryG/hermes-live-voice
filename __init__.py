@@ -1,17 +1,37 @@
-"""talk-desktop — Live Voice duplex nativo para Hermes Desktop.
-
-El backend del plugin (routes de mint) vive en ``dashboard/plugin_api.py``;
-este paquete no registra tools ni hooks — solo necesita existir pa que el
-plugin loader lo cargue y el dashboard monte sus routes.
-"""
-
+"""English-first Live Voice: Desktop/dashboard and scoped native Discord lane."""
 from __future__ import annotations
-
 import logging
+import threading
 
-_log = logging.getLogger("hermes.plugins.talk-desktop")
+_log = logging.getLogger('hermes.plugins.talk-desktop')
 
 
 def register(ctx) -> None:
-    """No-op registrado: el plugin es una surface de dashboard + desktop."""
-    _log.info("talk-desktop: dashboard API + desktop half (sin tools de agente)")
+    """Wire only the existing native Discord bot; no startup audio or providers."""
+    from hermes_constants import get_hermes_home
+    home = get_hermes_home().resolve()  # immutable registration scope, not a late ambient read
+    from .discord_voice.owner import capture_selection
+    selected_capture = capture_selection(home)  # environment/CWD only; no auth/config read
+    handles = []
+    unloaded = threading.Event()
+
+    def discord_factory(native, adapter):
+        if unloaded.is_set():
+            return
+        from .discord_voice.native import install
+        # Factory executes in the supplied adapter's profile context, not the
+        # Desktop selected bot context. Only its own persona file may be read.
+        handle = install(native, adapter, home=home, selected_capture=selected_capture)
+        handles.append(handle)
+
+    def unload():
+        unloaded.set()
+        for handle in handles:
+            handle.shutdown()
+        # Retain handles for pending cleanup; the host's synchronous hook cannot
+        # promise that a Discord HTTP deletion/disconnect has completed.
+        _log.warning('Live Voice unloaded: owning gateway restart required before re-enable/reload; native factory keys are cached for the bot lifetime.')
+
+    ctx.register_platform_handler('discord', discord_factory)
+    ctx.on_unload(unload)
+    _log.info('Live Voice: Desktop API and private native Discord commands registered')

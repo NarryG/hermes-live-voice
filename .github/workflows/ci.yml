@@ -17,7 +17,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install test deps
-        run: pip install pytest fastapi pyyaml
+        # discord.py==2.7.1 (with voice extras), aiortc/PyAV/aiohttp and tests
+        # are declared once in pyproject; native plugin installer reads that file.
+        run: pip install '.[test]'
       - name: Tests
         run: python -m pytest -q
       - name: Compile backend

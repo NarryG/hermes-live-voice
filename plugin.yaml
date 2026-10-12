@@ -1,5 +1,11 @@
 name: talk-desktop
-version: "0.2.5"
+version: "0.2.6"
 description: Full-duplex Live Voice for Hermes Desktop — Codex Live-1 (gpt-live-1) via the local
   Codex app-server on a ChatGPT subscription, with live transcript, voice tools and task
   delegation to the user's own agent. Optional gpt-realtime-2.1 lane.
+# Hermes signs the Realtime / usage requests with the user's openai-codex sign-in
+# (hermes_cli.plugin_provider_requests, NousResearch/hermes-agent#136117). The plugin
+# never reads, refreshes or rewrites a Codex token.
+requires_hermes: ">=0.21.7"
+requires_auth:
+  - openai-codex

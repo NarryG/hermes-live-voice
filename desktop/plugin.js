@@ -1170,7 +1170,6 @@ function CodexSection({ ctx }) {
   const [st, setSt] = useState(null)
   const [busy, setBusy] = useState(false)
   const [showInfo, setShowInfo] = useState(false)
-  const [confirmOut, setConfirmOut] = useState(false)
   const [localMsg, setLocalMsg] = useState('')
   const [usage, setUsage] = useState(null)
   const [usageBusy, setUsageBusy] = useState(false)
@@ -1220,11 +1219,10 @@ function CodexSection({ ctx }) {
     try { await ctx.rest('/codex/login/cancel', { method: 'POST' }) } catch {}
     refreshSoon()
   }
-  const logout = async () => {
-    setBusy(true); setLocalMsg('')
-    try { await ctx.rest('/codex/logout', { method: 'POST' }); setConfirmOut(false); refreshSoon() }
-    catch (e) { setLocalMsg(String(e?.message || e).slice(0, 140)) }
-    finally { setBusy(false) }
+  // The sign-in belongs to Hermes: the plugin never deletes ~/.codex/auth.json.
+  const HERMES_LOGOUT = 'hermes auth logout openai-codex'
+  const logout = () => {
+    setLocalMsg(tr('La sesión es de Hermes. Ciérrala con `' + HERMES_LOGOUT + '` o en Hermes Desktop > Providers.', 'The sign-in belongs to Hermes. Sign out with `' + HERMES_LOGOUT + '` or Hermes Desktop > Providers.'))
   }
   const copy = text => { try { navigator.clipboard?.writeText(text) } catch {} }
 
@@ -1234,7 +1232,7 @@ function CodexSection({ ctx }) {
     const oauth = st.codexOauth
     const lane = st.lane
     if (st.login && st.login.status === 'pending') chip = { text: tr('esperando…', 'waiting…'), color: '#ca8a04' }
-    else if (lane === 'codex-oauth' && (oauth === 'valid' || oauth === 'expired')) chip = { text: tr('Activa', 'Active') + (oauth === 'valid' ? '' : tr(' (renueva al usar)', ' (auto-renews)')), color: '#16a34a' }
+    else if (lane === 'codex-oauth' && (oauth === 'valid' || oauth === 'expired')) chip = { text: tr('Activa', 'Active') + (oauth === 'valid' ? '' : tr(' (Codex la renueva)', ' (Codex renews it)')), color: '#16a34a' }
     else if (lane === 'configured' || lane === 'env') chip = { text: 'API key', color: '#ca8a04' }
     else chip = { text: tr('Sin sesión', 'No session'), color: '#dc2626' }
   }
@@ -1274,7 +1272,7 @@ function CodexSection({ ctx }) {
     ] }),
     showInfo && jsx('div', {
       style: { fontSize: 11, lineHeight: 1.5, color: 'var(--ui-text-tertiary, #71717a)', background: 'rgba(127,127,127,0.08)', borderRadius: 8, padding: '8px 10px', marginBottom: 8 },
-      children: tr('La voz usa la suscripción de ChatGPT vía Codex OAuth (no una API key). Las credenciales viven solo en el servidor: este equipo nunca las ve. "Activa" = lista y se renueva sola. Iniciar sesión: te doy un link y un código; ábrelo en tu navegador e ingrésalo. Cerrar sesión desconecta la cuenta del servidor (voz y Codex CLI del VPS); se guarda un respaldo.', 'Voice uses the ChatGPT subscription via Codex OAuth (not an API key). Credentials live on the server only — this machine never sees them. "Active" = ready and self-renewing. Sign in: you get a link and a code; open it in your browser and enter it. Sign out disconnects the account from the server (voice + VPS Codex CLI); a backup is kept.')
+      children: tr('La voz usa la suscripción de ChatGPT vía Codex OAuth (no una API key). Las credenciales viven solo en el servidor: este equipo nunca las ve. "Activa" = lista. El plugin nunca toca el token: Hermes firma los requests con su propia sesión. Iniciar sesión: te doy un link y un código; ábrelo en tu navegador e ingrésalo. Para cerrar sesión usa `hermes auth logout openai-codex` o Hermes Desktop > Providers.', 'Voice uses the ChatGPT subscription via Codex OAuth (not an API key). Credentials live on the server only — this machine never sees them. "Active" = ready. The plugin never touches the token: Hermes signs the requests with its own sign-in. Sign in: you get a link and a code; open it in your browser and enter it. To sign out use `hermes auth logout openai-codex` or Hermes Desktop > Providers.')
     }),
     pending && jsxs('div', { style: { fontSize: 11.5, marginBottom: 8, lineHeight: 1.7 }, children: [
       jsxs('div', { children: [
@@ -1357,17 +1355,9 @@ function CodexSection({ ctx }) {
         ] }, 'ux-' + label)
       })
     ] }),
-    confirmOut
-      ? jsxs('div', { children: [
-          jsx('div', { style: { fontSize: 11, color: '#dc2626', lineHeight: 1.5, marginBottom: 6 }, children: tr('¿Cerrar la sesión de ChatGPT del servidor? Afecta la voz y el Codex CLI del VPS. Se guarda un respaldo.', 'Sign out the server ChatGPT session? Affects voice and the VPS Codex CLI. A backup is kept.') }),
-          jsxs('div', { style: { display: 'flex', gap: 6 }, children: [
-            cbtn(tr('Confirmar cierre', 'Confirm sign-out'), logout, 'danger'),
-            cbtn(tr('Cancelar', 'Cancel'), () => setConfirmOut(false), 'muted')
-          ] })
-        ] })
-      : jsxs('div', { style: { display: 'flex', gap: 6 }, children: [
+    jsxs('div', { style: { display: 'flex', gap: 6 }, children: [
           pending ? cbtn(tr('Reiniciar', 'Restart'), start) : cbtn(active ? tr('Reiniciar sesión', 'Restart sign-in') : tr('Iniciar sesión', 'Sign in'), start),
-          pending ? cbtn(tr('Cancelar', 'Cancel'), cancel, 'danger') : (active ? cbtn(tr('Cerrar sesión', 'Sign out'), () => setConfirmOut(true), 'danger') : null)
+          pending ? cbtn(tr('Cancelar', 'Cancel'), cancel, 'danger') : (active ? cbtn(tr('Cerrar sesión', 'Sign out'), logout, 'danger') : null)
         ] })
   ] })
 }

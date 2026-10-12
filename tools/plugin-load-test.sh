@@ -10,8 +10,9 @@
 set -euo pipefail
 
 PLUGIN="${1:-$(cd "$(dirname "$0")/.." && pwd)/desktop/plugin.js}"
-TMP=/tmp/plugin-load-test
-rm -rf "$TMP" && mkdir -p "$TMP/node_modules/@hermes/plugin-sdk" "$TMP/node_modules/react"
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/hermes-plugin-load.XXXXXX")
+trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$TMP/node_modules/@hermes/plugin-sdk" "$TMP/node_modules/react"
 
 cp "$PLUGIN" "$TMP/check.mjs"
 if node --check "$TMP/check.mjs"; then

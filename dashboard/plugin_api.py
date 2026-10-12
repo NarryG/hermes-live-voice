@@ -24,6 +24,7 @@ El secret efímero va SOLO al renderer del desktop; el OAuth nunca sale del VPS.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import logging
 import os
@@ -37,7 +38,19 @@ from pathlib import Path
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _TALK_VENDOR_ROOT = _PLUGIN_ROOT / "dashboard" / "talk_vendor"
-_HERMES_TALK_ROOT = Path.home() / ".hermes" / "plugins" / "hermes-talk"
+# Load the bundled resolver by exact path, independent of a host dashboard package,
+# without binding talk_config: a full adapter at the active home keeps precedence.
+_HOME_RESOLVER_SPEC = importlib.util.spec_from_file_location(
+    "_hermes_live_voice_bundled_talk_config", _TALK_VENDOR_ROOT / "talk_config.py"
+)
+if _HOME_RESOLVER_SPEC is None or _HOME_RESOLVER_SPEC.loader is None:
+    raise ImportError("Could not load the bundled Live Voice home resolver")
+_HOME_RESOLVER = importlib.util.module_from_spec(_HOME_RESOLVER_SPEC)
+sys.modules[_HOME_RESOLVER_SPEC.name] = _HOME_RESOLVER
+_HOME_RESOLVER_SPEC.loader.exec_module(_HOME_RESOLVER)
+_get_hermes_home = _HOME_RESOLVER.get_hermes_home
+
+_HERMES_TALK_ROOT = _get_hermes_home() / "plugins" / "hermes-talk"
 # Orden de precedencia (el último insertado gana): el plugin hermes-talk completo
 # si está instalado; si no, el bundle vendorizado que viaja en el repo.
 for _p in (str(_PLUGIN_ROOT), str(_TALK_VENDOR_ROOT), str(_HERMES_TALK_ROOT)):
@@ -62,15 +75,22 @@ except ImportError:  # pragma: no cover
 router = APIRouter() if APIRouter else None
 _log = logging.getLogger("hermes.plugins.talk-desktop")
 
-_PROFILES_ROOT = Path.home() / ".hermes" / "profiles"
+# Keep the host resolver separate from the temporary selected-profile override.
+_HOST_HERMES_HOME = talk_config.get_hermes_home
 _MINT_LOCK = threading.Lock()
 
 
+def _profiles_root() -> Path:
+    home = _HOST_HERMES_HOME()
+    return home.parent if home.parent.name == "profiles" else home / "profiles"
+
+
 def _list_bots() -> list[str]:
-    if not _PROFILES_ROOT.is_dir():
+    root = _profiles_root()
+    if not root.is_dir():
         return []
     return sorted(
-        e.name for e in _PROFILES_ROOT.iterdir()
+        e.name for e in root.iterdir()
         if e.is_dir() and (e / "SOUL.md").is_file()
     )
 
@@ -81,7 +101,7 @@ def _profile_home(profile: str) -> Path | None:
     # resuelto quede bajo profiles/ — solo que el nombre sea seguro y exista.
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", profile or ""):
         return None
-    p = _PROFILES_ROOT / profile
+    p = _profiles_root() / profile
     if not p.is_dir():
         return None
     return p.resolve()
@@ -152,7 +172,8 @@ def _bot_identity_sections(profile: str) -> dict[str, str]:
 
 
 _DIRECTIVE_PATH = _PLUGIN_ROOT / "language_directive.txt"
-_LANGUAGE_DIRECTIVE_DEFAULT = {
+# Exact old shipped strings are migration sentinels, not active instructions.
+_LANGUAGE_DIRECTIVE_LEGACY = {
     "es": (
         '\n\nIDIOMA Y VOZ: Habla en el idioma en que te habla el usuario — si te habla en español, responde en '
         'español natural de Chile; si te habla en inglés, en inglés. Nunca mezcles idiomas ni respondas en '
@@ -167,21 +188,42 @@ _LANGUAGE_DIRECTIVE_DEFAULT = {
     ),
 }
 
+_LANGUAGE_DIRECTIVE_DEFAULT = {
+    "en": (
+        '\n\nLANGUAGE AND VOICE: Use clear, natural English by default. If the user speaks another '
+        'language or explicitly requests one, respond in that language. Do not assume a regional '
+        'dialect or accent. Keep your spoken replies clear and easy to understand.'
+    ),
+    "es": (
+        '\n\nIDIOMA Y VOZ: Usa español claro y natural. Si el usuario habla otro idioma o pide '
+        'uno explícitamente, responde en ese idioma. No presupongas un dialecto o acento regional. '
+        'Mantén tus respuestas habladas claras y fáciles de entender.'
+    ),
+}
+
 _LANGUAGE_DIRECTIVE_BUNDLE = "\n\n".join(value.strip() for value in _LANGUAGE_DIRECTIVE_DEFAULT.values())
 
 
-def _language_directive(language: str = "es") -> str:
+def _session_language(language: str | None = "en") -> str:
+    """English fallback; only an explicit Spanish locale selects Spanish."""
+    locale = language.strip().lower().replace("_", "-") if isinstance(language, str) else ""
+    return "es" if locale.split("-", 1)[0] == "es" else "en"
+
+
+def _language_directive(language: str = "en") -> str:
     """Select shipped defaults by locale; preserve custom file content verbatim."""
     try:
         if _DIRECTIVE_PATH.is_file():
             text = _DIRECTIVE_PATH.read_text(encoding="utf-8")
             shipped = {value.strip() for value in _LANGUAGE_DIRECTIVE_DEFAULT.values()}
+            shipped.update(value.strip() for value in _LANGUAGE_DIRECTIVE_LEGACY.values())
             shipped.add(_LANGUAGE_DIRECTIVE_BUNDLE)
+            shipped.add("\n\n".join(value.strip() for value in _LANGUAGE_DIRECTIVE_LEGACY.values()))
             if text.strip() and text.strip() not in shipped:
                 return "\n\n" + text
     except OSError:
         pass
-    return _LANGUAGE_DIRECTIVE_DEFAULT["en" if language == "en" else "es"]
+    return _LANGUAGE_DIRECTIVE_DEFAULT[_session_language(language)]
 
 
 def _resolve_voice(requested: str | None) -> str:
@@ -190,7 +232,7 @@ def _resolve_voice(requested: str | None) -> str:
         v = str(requested).strip().lower()
         if v in talk_config.OPENAI_REALTIME_VOICES:
             return v
-        raise HTTPException(status_code=400, detail=f"voice '{v}' no disponible")
+        raise HTTPException(status_code=400, detail=f"voice '{v}' is not available")
     try:
         return talk_config.voice() or "marin"
     except Exception:  # noqa: BLE001
@@ -225,8 +267,9 @@ def _send_to_chat_tool() -> dict:
     }
 
 
-def _mint_for(profile: str | None, voice: str, allow_chat: bool = True, language: str = "es"):
+def _mint_for(profile: str | None, voice: str, allow_chat: bool = True, language: str = "en"):
     """Mint con identity del bot (o del host si no se pide profile)."""
+    language = _session_language(language)
     tools = talk_tools.default_talk_tools()
     if allow_chat:
         tools = tools + [_send_to_chat_tool()]
@@ -363,7 +406,7 @@ def _login_check() -> None:
         started = _LOGIN.get("started_at") or 0
         if time.time() - started > _LOGIN_TIMEOUT_S:
             _terminate(proc)
-            _LOGIN.update(status="error", message="timeout: el código expiró sin aprobarse", proc=None)
+            _LOGIN.update(status="error", message="Sign-in timed out: the code expired without approval", proc=None)
         return
     # process finished (or vanished)
     try:
@@ -372,11 +415,11 @@ def _login_check() -> None:
     except Exception:  # noqa: BLE001
         state = None
     if state in {"valid", "expired"}:
-        _LOGIN.update(status="done", message="Sesión iniciada", proc=None, url=None, code=None,
+        _LOGIN.update(status="done", message="Signed in", proc=None, url=None, code=None,
                       output="")
     else:
         tail = " / ".join((_LOGIN.get("output") or "").strip().splitlines()[-3:])
-        _LOGIN.update(status="error", message=("No se pudo iniciar sesión" + (f": {tail}" if tail else "")),
+        _LOGIN.update(status="error", message=("Could not sign in" + (f": {tail}" if tail else "")),
                       proc=None)
 
 
@@ -388,7 +431,7 @@ def _start_codex_login() -> dict:
             _terminate(proc)
         binary = _codex_binary()
         if not binary:
-            return {"ok": False, "message": "codex CLI no encontrado en el servidor"}
+            return {"ok": False, "message": "Codex CLI was not found on the server"}
         # Respaldo de la sesión actual: iniciar un login nuevo puede reemplazar/limpiar
         # ~/.codex/auth.json antes de completarse (verificado 2026-09-11).
         auth_path = _codex_auth_path()
@@ -448,8 +491,9 @@ if router is not None:
             body = {}
         profile = str(body.get("profile") or "").strip() or None
         allow_chat = bool(body.get("allowChat", True))
-        if profile and _profile_home(profile) is None:
-            raise HTTPException(status_code=400, detail=f"perfil '{profile}' no existe")
+        profile_home = _profile_home(profile) if profile else None
+        if profile and profile_home is None:
+            raise HTTPException(status_code=400, detail=f"profile '{profile}' does not exist")
         voice = _resolve_voice(body.get("voice"))
 
         def _do():
@@ -462,7 +506,7 @@ if router is not None:
             with _MINT_LOCK:
                 if profile:
                     orig = talk_config.get_hermes_home
-                    talk_config.get_hermes_home = lambda: _profile_home(profile)
+                    talk_config.get_hermes_home = lambda: profile_home
                     try:
                         return _mint_for(profile, voice, allow_chat, body.get("language"))
                     finally:
@@ -537,7 +581,7 @@ if router is not None:
                     return {"ok": False, "error": f"usage http {last_status}"}
                 rl = payload.get("rate_limit") or {}
                 windows: dict = {}
-                for key, fallback in (("primary_window", "5h"), ("secondary_window", "semanal")):
+                for key, fallback in (("primary_window", "primary"), ("secondary_window", "secondary")):
                     w = rl.get(key) or {}
                     if not (isinstance(w, dict) and w):
                         continue
@@ -550,10 +594,10 @@ if router is not None:
                             mins = None
                     if mins:
                         mins = int(mins)
-                        if mins >= 6 * 1440:
-                            label = "semanal"
+                        if mins == 7 * 1440:
+                            label = "weekly"
                         else:
-                            label = f"{max(1, round(mins / 60))}h"
+                            label = f"{mins // 60}h" if mins % 60 == 0 else f"{mins}m"
                     else:
                         label = fallback
                     windows[label] = {
@@ -600,7 +644,7 @@ if router is not None:
         dur = max(0, int((body or {}).get("durationMs") or 0))
         aud = max(0, int((body or {}).get("audioMs") or 0))
         if dur <= 0:
-            return {"ok": False, "error": "durationMs requerido"}
+            return {"ok": False, "error": "durationMs is required"}
         now_ms = int(time.time() * 1000)
         with _VU_LOCK:
             data = _vu_load()
@@ -645,7 +689,7 @@ if router is not None:
             body = await request.json()
         except Exception:  # noqa: BLE001
             body = {}
-        language = body.get("language")
+        language = _session_language(body.get("language"))
         name = str(body.get("name") or "").strip()
         arguments = body.get("arguments")
         if not isinstance(arguments, dict):
@@ -707,15 +751,15 @@ if router is not None:
         def _do() -> dict:
             path = _codex_auth_path()
             if not path.exists():
-                return {"ok": True, "message": "No había sesión que cerrar"}
+                return {"ok": True, "message": "There was no session to sign out of"}
             ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
             bak = path.with_name(f"auth.json.bak-voice-logout-{ts}")
             try:
                 shutil.copy2(path, bak)
                 path.unlink()
             except OSError as exc:
-                return {"ok": False, "message": f"No se pudo cerrar la sesión: {exc}"}
-            return {"ok": True, "message": f"Sesión cerrada (respaldo: {bak.name})"}
+                return {"ok": False, "message": f"Could not sign out: {exc}"}
+            return {"ok": True, "message": f"Signed out (backup: {bak.name})"}
 
         return await asyncio.to_thread(_do)
 
@@ -733,7 +777,7 @@ _CL_LOCK = threading.Lock()
 def _cl_send(obj: dict) -> None:
     proc = _CL["proc"]
     if proc is None or proc.poll() is not None:
-        raise RuntimeError("codex app-server no disponible")
+        raise RuntimeError("codex app-server is not available")
     proc.stdin.write(json.dumps(obj) + "\n")
     proc.stdin.flush()
 
@@ -768,7 +812,7 @@ def _cl_request(method: str, params: dict, timeout: float = 30.0):
                     raise RuntimeError(str(m["error"].get("message") or m["error"])[:400])
                 return m.get("result")
         time.sleep(0.1)
-    raise TimeoutError(f"codex app-server: {method} sin respuesta")
+    raise TimeoutError(f"codex app-server: {method} did not respond")
 
 
 def _codex_binary() -> str | None:
@@ -822,7 +866,8 @@ def _cl_ensure() -> None:
                                "capabilities": {"experimentalApi": True}}, timeout=25)
 
 
-def _codexlive_persona(profile: str | None, language: str = "es") -> str:
+def _codexlive_persona(profile: str | None, language: str = "en") -> str:
+    language = _session_language(language)
     if profile:
         sections = _bot_identity_sections(profile)
         name = _bot_display_name(profile)
@@ -886,9 +931,9 @@ _VOICE_POLICY = (
 )
 
 
-def _voice_policy(language: str = "es") -> str:
+def _voice_policy(language: str = "en") -> str:
     # The shared English policy is outside localization scope; localize its example.
-    return _VOICE_POLICY if language == "en" else _VOICE_POLICY.replace("sure, I will check", "dale, lo reviso")
+    return _VOICE_POLICY if _session_language(language) == "en" else _VOICE_POLICY.replace("sure, I will check", "dale, lo reviso")
 
 
 def _talk_settings() -> dict:
@@ -912,8 +957,8 @@ def _agent_model() -> str | None:
     return v or None
 
 
-def _cl_thread_ensure(language: str = "es") -> str:
-    language = "en" if language == "en" else "es"
+def _cl_thread_ensure(language: str = "en") -> str:
+    language = _session_language(language)
     want = _agent_model()
     tid = _CL.get("thread_id")
     if tid and _CL.get("thread_model") == want and _CL.get("thread_language") == language:
@@ -924,7 +969,7 @@ def _cl_thread_ensure(language: str = "es") -> str:
     th = _cl_request("thread/start", body, timeout=30)
     tid = ((th or {}).get("thread") or {}).get("id")
     if not tid:
-        raise RuntimeError("codex: no se pudo crear el thread")
+        raise RuntimeError("codex: could not create the thread")
     _CL["thread_id"] = tid
     _CL["thread_model"] = want
     _CL["thread_language"] = language
@@ -949,7 +994,8 @@ def _rejected_field_name(message: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _codexlive_start(profile: str | None, voice: str, offer: str, language: str = "es") -> dict:
+def _codexlive_start(profile: str | None, voice: str, offer: str, language: str = "en") -> dict:
+    language = _session_language(language)
     _cl_ensure()
     tid = _cl_thread_ensure(language)
     persona = _codexlive_persona(profile, language)
@@ -985,8 +1031,8 @@ def _codexlive_start(profile: str | None, voice: str, offer: str, language: str 
                 if norm == "clientmanagedhandoffs" and "clientManagedHandoffs" in params:
                     if client_managed:
                         raise RuntimeError(
-                            "LIVE_HANDOFF_NO_SOPORTADO: el app-server de Codex no soporta clientManagedHandoffs; "
-                            "actualiza Codex, usa delegation=server o el motor gpt-realtime"
+                            "LIVE_HANDOFF_NO_SOPORTADO: the Codex app-server does not support clientManagedHandoffs; "
+                            "update Codex to use client-managed handoffs. No delegation or voice engine was changed."
                         ) from exc
                     params.pop("clientManagedHandoffs")
                     dropped.append("clientManagedHandoffs")
@@ -1000,10 +1046,10 @@ def _codexlive_start(profile: str | None, voice: str, offer: str, language: str 
                             dropped.append(f)
                     start = len(_CL["notifs"])
                     continue
-                shown = f"'{name}'" if name else "(sin nombre legible)"
+                shown = f"'{name}'" if name else "(no readable name)"
                 raise RuntimeError(
-                    f"codex live: el app-server rechazó el campo {shown} de thread/realtime/start "
-                    f"y no se puede omitir: {str(exc)[:200]}"
+                    f"codex live: the app-server rejected field {shown} in thread/realtime/start "
+                    f"and it cannot be omitted: {str(exc)[:200]}"
                 ) from exc
             if "thread" in low and ("not found" in low or "no such" in low or "not loaded" in low or "missing" in low):
                 # thread obsoleto: recrear y reintentar una vez
@@ -1016,8 +1062,8 @@ def _codexlive_start(profile: str | None, voice: str, offer: str, language: str 
                 break
             if "usage limit" in low or "hit your usage" in low:
                 raise RuntimeError(
-                    "LIVE_SIN_QUOTA: el plan ChatGPT llegó a su límite semanal (Live Voice comparte esa cuota). "
-                    "Cambia el Motor de voz a gpt-realtime-2.1 en la configuración, o espera el reset semanal."
+                    "LIVE_SIN_QUOTA: the provider reported a usage limit for Codex Live. "
+                    "Check your provider's usage information before retrying. No voice engine or billing lane was changed."
                 )
             if "already" in low:
                 # sesión realtime colgada en el thread: cerrarla y reintentar
@@ -1045,13 +1091,13 @@ def _codexlive_start(profile: str | None, voice: str, offer: str, language: str 
             break
         time.sleep(0.15)
     if not answer:
-        raise TimeoutError("codex live: sin SDP de respuesta")
+        raise TimeoutError("codex live: no SDP answer received")
     result = {"answer": answer, "realtimeSessionId": rsid, "threadId": params.get("threadId") or tid, "version": "v3", "engine": "codex",
               "handoff": "client" if client_managed else "server"}
     if dropped:
-        _log.warning("codex live: app-server no soporta %s (se omitieron)", ", ".join(dropped))
+        _log.warning("codex live: app-server does not support %s (omitted)", ", ".join(dropped))
         result["droppedFields"] = dropped
-        result["warning"] = "el app-server no soporta: " + ", ".join(dropped) + " (se omitieron)"
+        result["warning"] = "the app-server does not support: " + ", ".join(dropped) + " (omitted)"
     return result
 
 
@@ -1074,11 +1120,11 @@ if router is not None:
             body = {}
         profile = str(body.get("profile") or "").strip() or None
         if profile and _profile_home(profile) is None:
-            raise HTTPException(status_code=400, detail=f"perfil '{profile}' no existe")
+            raise HTTPException(status_code=400, detail=f"profile '{profile}' does not exist")
         voice = str(body.get("voice") or "cove")
         offer = str(body.get("offer") or "")
         if not offer:
-            raise HTTPException(status_code=400, detail="falta el SDP offer")
+            raise HTTPException(status_code=400, detail="SDP offer is required")
 
         def _do():
             with _CL_LOCK:
@@ -1107,7 +1153,7 @@ if router is not None:
         turn_id = str(body.get("turnId") or "").strip()
         thread_id = str(body.get("threadId") or "").strip() or _CL.get("thread_id")
         if not turn_id or not thread_id:
-            return {"ok": False, "error": "faltan turnId/threadId"}
+            return {"ok": False, "error": "turnId/threadId are required"}
         try:
             await asyncio.to_thread(
                 _cl_request, "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}, timeout=8

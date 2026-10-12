@@ -23,6 +23,7 @@ const KEY_MIC = 'mic.v3'
 const KEY_OUT = 'out.v3'
 const KEY_CHAT = 'chatwork.v1'
 const KEY_ENGINE = 'engine.v1'
+const KEY_LANGUAGE = 'language.v1'
 const VOICES = ['marin', 'cedar', 'alloy', 'echo', 'shimmer', 'verse', 'sage', 'ballad']
 const V3_VOICES = ['cove', 'juniper', 'maple', 'spruce', 'ember', 'vale', 'breeze', 'arbor', 'sol']
 const effVoiceFor = (engine, stored) => {
@@ -32,7 +33,8 @@ const effVoiceFor = (engine, stored) => {
 }
 const SENTINEL_DEFAULT = '__default'
 const SENTINEL_HOST = '__host'
-const EN = String((typeof navigator !== 'undefined' && navigator.language) || 'en').toLowerCase().indexOf('en') === 0
+// English is the owner-neutral default. Browser locale must not choose a voice language.
+let EN = true
 const tr = (es, en) => (EN ? en : es)
 
 // A POST to /api/plugins/talk-desktop/* that the dashboard does not route (backend half not
@@ -47,15 +49,7 @@ const backendHint = (msg) => {
   return m
 }
 
-// Allowance de VOZ de Codex en desktop: ventana rolling de 5 horas, por plan.
-// Fuente: learn.chatgpt.com/docs/pricing (Plus ~15-30 min; Pro 5x ~1-2.5 h; Pro 20x ilimitado).
-const VOICE_CAP_MIN = plan => {
-  const p = String(plan || '').toLowerCase()
-  if (p.indexOf('plus') >= 0) return [15, 30]
-  if (p.indexOf('business') >= 0 || p.indexOf('enterprise') >= 0 || p.indexOf('edu') >= 0) return [45, 45]
-  if (p.indexOf('pro') >= 0) return [60, 150]
-  return null
-}
+
 const SB = 'var(--popover-surface, #ffffff)'
 
 const bus = {
@@ -318,7 +312,7 @@ function handleDelegation(ctx, msg, dc) {
   if (_delegBusy) {
     _delegQueue = { req, itemId, at: Date.now() }
     pushTranscript('tool', tr('en cola (tarea en curso): ', 'queued (task in progress): ') + req.slice(0, 100))
-    _delegRespond(dc, itemId, tr('Ya hay una tarea en curso. Dile al usuario que sigues trabajando en eso; si lo que dijo es una corrección, se verá reflejada en el resultado, y si es algo nuevo, espera a que termine lo actual.', 'A task is already in progress. Tell the user you are still on it; if what they said is a correction it will be reflected in the result, if it is something new, wait for the current one to finish.'))
+    _delegRespond(dc, itemId, tr('Ya hay una tarea en curso. La petición más reciente está en una cola local; aún no se aplicó a la tarea en curso. No afirmes que una corrección fue aceptada ni prometas un resultado.', 'A task is already in progress. The latest request is queued locally; it has not yet been applied to the running task. Do not claim a correction was accepted or promise a result.'))
     return
   }
   _runDelegation(ctx, dc, itemId, req)
@@ -498,13 +492,13 @@ async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
   clearTranscript()
   liveAudioMs = 0
   bus.set({ err: '', widget: true, stage: 'mint' })
-  log('pidiendo sesión…')
+  log(tr('pidiendo sesión…', 'requesting session…'))
   let sess = null
   if (eng !== 'codex') {
     sess = await mintSession(ctx, profile, voice, (ctx.storage.get(KEY_CHAT) || '1') !== '0')
     bus.botName = sess.botName || ''
   }
-  log('abriendo micrófono…')
+  log(tr('abriendo micrófono…', 'opening microphone…'))
   const audioC = { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
   if (micId) audioC.deviceId = { exact: micId }
   let stream
@@ -554,7 +548,7 @@ async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
 
   // canal de eventos: transcripción en vivo + llamadas a tools
   const dc = pc.createDataChannel('oai-events')
-  dc.onopen = () => log('canal de eventos abierto')
+  dc.onopen = () => log(tr('canal de eventos abierto', 'event channel open'))
   dc.onmessage = ev => {
     let msg = null
     try { msg = JSON.parse(ev.data) } catch { return }
@@ -563,14 +557,14 @@ async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
 
   let audioEl = null
   pc.ontrack = ev => {
-    log('audio del bot conectado')
+    log(tr('audio del bot conectado', 'bot audio connected'))
     const remoteStream = ev.streams[0]
     audioEl = new Audio()
     audioEl.srcObject = remoteStream
     audioEl.autoplay = true
-    audioEl.play().catch(() => log('click para reproducir audio'))
+    audioEl.play().catch(() => log(tr('click para reproducir audio', 'click to play audio')))
   if (_liveRefs) _liveRefs.audioEl = audioEl
-    if (outId && audioEl.setSinkId) audioEl.setSinkId(outId).catch(e => log('salida: ' + e.message))
+    if (outId && audioEl.setSinkId) audioEl.setSinkId(outId).catch(e => log(tr('salida: ', 'output: ') + e.message))
     const an = audioCtx.createAnalyser(); an.fftSize = 256
     const src = audioCtx.createMediaStreamSource(remoteStream)
     const mute = audioCtx.createGain(); mute.gain.value = 0
@@ -613,7 +607,7 @@ async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
     }
   }
 
-  log('negociando…')
+  log(tr('negociando…', 'negotiating…'))
   const offer = await pc.createOffer()
   await pc.setLocalDescription(offer)
   let codexSession = null
@@ -644,7 +638,7 @@ async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
     }
     await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() })
   }
-  log('en vivo')
+  log(tr('en vivo', 'live'))
 
   // poll de niveles WebRTC cada 250ms (audioLevel outbound=mic / inbound=bot)
   const statsTimer = setInterval(() => {
@@ -963,6 +957,8 @@ function ConfigForm({ ctx, dense = false }) {
   const [outId, setOutId] = useState(() => ctx.storage.get(KEY_OUT) || '')
   const [chatWork, setChatWork] = useState(() => (ctx.storage.get(KEY_CHAT) || '1') !== '0')
   const [engine, setEngine] = useState(() => ctx.storage.get(KEY_ENGINE) || 'codex')
+  const [language, setLanguage] = useState(() => EN ? 'en' : 'es')
+  const liveState = useLiveState()
   const [micTest, setMicTest] = useState({ on: false, err: '' })
   const [pvVoice, setPvVoice] = useState({ state: 'idle', voice: '' })
   const micBarRef = useRef(null)
@@ -1073,6 +1069,28 @@ function ConfigForm({ ctx, dense = false }) {
       })
     ] }),
     jsxs('div', { style: field, children: [
+      jsx('div', { style: label, children: tr('Idioma de voz', 'Voice language') }),
+      jsxs(Select, {
+        value: language, 'aria-label': tr('Idioma de voz', 'Voice language'),
+        disabled: liveState.live || liveState.stage === 'mint' || liveState.stage === 'offering',
+        onValueChange: value => {
+          if (bus.live || bus.stage === 'mint' || bus.stage === 'offering') return
+          const next = value === 'es' ? 'es' : 'en'
+          try { ctx.storage.set(KEY_LANGUAGE, next) } catch { return }
+          EN = next !== 'es'
+          setLanguage(next)
+          bus.emit()
+        },
+        children: [
+          jsx(SelectTrigger, { style: trigStyle, children: jsx(SelectValue, { style: valStyle }) }),
+          jsxs(SelectContent, { children: [
+            jsx(SelectItem, { value: 'en', children: 'English' }),
+            jsx(SelectItem, { value: 'es', children: 'Español' })
+          ] })
+        ]
+      })
+    ] }),
+    jsxs('div', { style: field, children: [
       jsx('div', { style: label, children: 'Bot' }),
       jsxs(Select, { value: profile === '' ? '__auto' : profile, onValueChange: v => setProfile(v === '__auto' ? '' : v), children: [
         jsx(SelectTrigger, { style: trigStyle, children: jsx(SelectValue, { style: valStyle }) }),
@@ -1155,7 +1173,7 @@ function ConfigForm({ ctx, dense = false }) {
         jsx(SelectTrigger, { style: trigStyle, children: jsx(SelectValue, { style: valStyle }) }),
         jsxs(SelectContent, { children: [
           jsx(SelectItem, { value: SENTINEL_DEFAULT, children: tr('Predeterminado del sistema', 'System default') }),
-          ...devs.outs.map((d, i) => jsx(SelectItem, { value: String(d.deviceId), children: opt(d.label || ('Salida ' + (i + 1))) }, 'out-' + i))
+          ...devs.outs.map((d, i) => jsx(SelectItem, { value: String(d.deviceId), children: opt(d.label || (tr('Salida ', 'Output ') + (i + 1))) }, 'out-' + i))
         ] })
       ] })
     ] }),
@@ -1308,27 +1326,20 @@ function CodexSection({ ctx }) {
         const v = usage.voice
         const r5 = v.rolling5h || {}
         const r5min = Number((r5.audioMinutes != null && r5.audioMinutes > 0) ? r5.audioMinutes : (r5.minutes || 0))
-        const cap = VOICE_CAP_MIN(usage.plan)
-        const lo = cap ? cap[0] : 0
-        const pct = lo ? Math.max(0, Math.min(100, Math.round(r5min / lo * 100))) : 0
-        const color = pct >= 80 ? '#dc2626' : pct >= 50 ? '#ca8a04' : '#16a34a'
-        const capTxt = cap ? ('~' + cap[0] + (cap[1] !== cap[0] ? '-' + cap[1] : '') + ' min') : ''
-        const used = r5min >= 1 ? (Math.round(r5min * 10) / 10).toString().replace('.', ',') + ' min' : Math.round(r5min * 60) + ' s'
+        const used = r5min >= 1 ? r5min.toLocaleString(EN ? 'en' : 'es', { maximumFractionDigits: 1 }) + ' min' : Math.round(r5min * 60) + ' s'
         const r24 = v.rolling24h || {}
         const r24min = Math.round(Number(r24.audioMinutes > 0 ? r24.audioMinutes : (r24.minutes || 0)))
         return jsxs('div', { style: { marginBottom: 8 }, children: [
           jsxs('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 10.5, color: 'var(--ui-text-tertiary, #71717a)' }, children: [
             jsx('span', { children: 'Live Voice' + tr(' · 5 h rodantes', ' · rolling 5 h') }),
-            jsx('span', { style: { fontWeight: 700, color: cap ? color : 'var(--ui-text-tertiary, #71717a)' }, children: used + (capTxt ? ' / ' + capTxt : '') })
+            jsx('span', { style: { fontWeight: 700, color: 'var(--ui-text-tertiary, #71717a)' }, children: used })
           ] }),
-          cap && jsx('div', { style: { height: 4, borderRadius: 2, background: 'rgba(127,127,127,0.18)', marginTop: 2, overflow: 'hidden' }, children:
-            jsx('div', { style: { height: 4, width: pct + '%', background: color } }) }),
           jsxs('div', { style: { fontSize: 10, color: 'var(--ui-text-tertiary, #71717a)', marginTop: 2, display: 'flex', justifyContent: 'space-between' }, children: [
             jsx('span', { children: '24 h: ' + r24min + ' min' }),
             jsx('span', { children: ((v.week && v.week.sessions) || 0) + tr(' sesiones · 7 d: ', ' sessions · 7 d: ') + Math.round((v.week && v.week.minutes) || 0) + ' min' })
           ] }),
           jsx('div', { style: { fontSize: 9.5, color: 'var(--ui-text-tertiary, #71717a)', marginTop: 1 }, children: ((v.week && v.week.sessions) || 0) > 0
-            ? tr('min de voz activa (medido al colgar) · allowance: voz de Codex del plan', 'active voice min (measured on hangup) · plan allowance: Codex voice')
+            ? tr('duración medida localmente al colgar · no es la cuota del proveedor', 'locally measured duration on hangup · not provider quota')
             : tr('se registra al colgar cada llamada', 'recorded when each call ends') })
         ] })
       })(),
@@ -1526,10 +1537,7 @@ function ComposerLiveButton({ ctx }) {
       let m = backendHint(String(e?.message || e))
       if (m.indexOf('LIVE_SIN_QUOTA') >= 0) {
         m = m.replace('LIVE_SIN_QUOTA: ', '')
-        try {
-          ctx.storage.set(KEY_ENGINE, 'realtime')
-          pushTranscript('sys', tr('Plan semanal sin quota: motor cambiado a gpt-realtime-2.1 — prueba de nuevo.', 'Weekly plan out of quota: engine switched to gpt-realtime-2.1 — try again.'))
-        } catch {}
+        pushTranscript('sys', tr('El proveedor rechazó la llamada por un límite de uso. No se cambió el motor ni la facturación.', 'The provider refused the call due to a usage limit. Voice engine and billing settings were not changed.'))
       }
       if (m.indexOf('LIVE_HANDOFF_NO_SOPORTADO') >= 0) {
         m = tr('Este Codex no soporta delegar en tu chat (clientManagedHandoffs): actualiza Codex, usa delegation=server o el motor gpt-realtime.', 'This Codex does not support delegating to your chat (clientManagedHandoffs): update Codex, use delegation=server or the gpt-realtime engine.')
@@ -1762,6 +1770,7 @@ export default {
   id: 'talk-desktop',
   name: 'Live Voice',
   register(ctx) {
+    try { EN = ctx.storage.get(KEY_LANGUAGE) !== 'es' } catch { EN = true }
     ctx.register({
       id: 'composer-live',
       area: 'composer.leading',

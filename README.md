@@ -1,4 +1,4 @@
-# Live Voice for Hermes Desktop 🎙️
+# Live Voice for Hermes Desktop — English-first fork 🎙️
 
 Native **full-duplex voice** for [Hermes](https://github.com/NousResearch/hermes-agent) — talk to your
 bots from Hermes Desktop with real-time audio, live transcript, voice tool calls and task delegation.
@@ -7,9 +7,22 @@ bots from Hermes Desktop with real-time audio, live transcript, voice tool calls
 through the local **Codex app-server**, running on a **ChatGPT/Codex subscription** — no API key needed
 for the voice lane.
 
-[![CI](https://github.com/Synero/hermes-live-voice/actions/workflows/ci.yml/badge.svg)](https://github.com/Synero/hermes-live-voice/actions/workflows/ci.yml)
+This is the owner's fork at [NarryG/hermes-live-voice](https://github.com/NarryG/hermes-live-voice), based on Synero's MIT-licensed plugin. The runtime key remains `talk-desktop`; it is not the full Hermes Talk plugin.
+
+## Fork behavior
+
+- English is the default for the Desktop UI, voice prompts and missing/unknown request languages, regardless of browser locale. Spanish is an explicit choice in **Voice language** settings, not an inferred default.
+- Shipped prompts do not impose Chilean Spanish or another developer's personal identity. Owner-authored `SOUL.md`, memory and custom `language_directive.txt` content are not translated or rewritten.
+- Subscription failures do not select another voice engine or paid billing lane. Existing account/model/provider/voice choices stay in place.
+- Local call duration is labeled as a local measurement, not an invented plan allowance. Provider-reported usage remains separate.
+- Backend profile paths follow Hermes's actual home rather than assuming a developer's `~/.hermes` layout. The example settings do not pin the developer's worker model.
+- Queuing a correction is not reported as proof that the running task applied it.
+
+These changes are regression-tested without provider calls or microphones. A successful live call still requires the user's own authorized Codex login and provider entitlement.
+
+[![CI](https://github.com/NarryG/hermes-live-voice/actions/workflows/ci.yml/badge.svg)](https://github.com/NarryG/hermes-live-voice/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.2.5-informational)](plugin.yaml)
+[![Version](https://img.shields.io/badge/version-0.2.6%2Bbuffer.1-informational)](plugin.yaml)
 [![Status: preview](https://img.shields.io/badge/status-preview-orange)](#status--roadmap)
 
 [![Live Voice demo: a spoken request is delegated to the open chat and the answer is read back](docs/media/live-voice-demo.gif)](docs/media/live-voice-demo.mp4)
@@ -42,7 +55,7 @@ for the voice lane.
 - 📝 **Live transcript** — iMessage-style bubbles (you / bot), streaming deltas, tool activity chips.
 - 🛠️ **Tools from voice** — the model can run tasks: by default they are delegated into your **focused Hermes chat**, i.e. your own agent with **your** models and providers. A voice-side delegation policy keeps this clean (only real task requests are delegated, fillers stay conversational) and an internal queue prevents overlapping runs. An opt-in server-agent mode also exists.
 - 🎚️ **Audio & call controls** — device pickers, built-in mic test, one-tap **mute** and hang-up right in the composer.
-- 📊 **Usage panels** — measured voice minutes (rolling windows) and the Codex plan bucket.
+- 📊 **Usage panels** — locally measured call duration, separately from provider-reported Codex usage. No hardcoded voice allowance estimates.
 
 <table>
 <tr>
@@ -66,16 +79,17 @@ The plugin ships as a **unified package**: a backend half (`dashboard/plugin_api
 Hermes dashboard under `/api/plugins/talk-desktop/`) and a desktop half (`desktop/plugin.js`, loaded by
 the Hermes Desktop app).
 
-### From the Hermes plugin catalog
+### Install this fork
 
 ```bash
-hermes plugins install hermes-live-voice   # curated catalog · tier: community
+hermes plugins install NarryG/hermes-live-voice --no-enable
+# Inspect the installed source/dependencies, then enable:
+hermes plugins show talk-desktop
+hermes plugins doctor talk-desktop
 hermes plugins enable talk-desktop
 ```
 
-The catalog entry pins a released revision of this repo (updates: `hermes plugins update
-hermes-live-voice`). It lands in `$HERMES_HOME/plugins/talk-desktop` — the folder name the desktop
-app expects — so the desktop half is picked up on the next app start.
+For a reproducible install, add `--ref` with the verified 40-character commit from this fork. The curated `hermes-live-voice` catalog entry still points to the original upstream, not this fork. Preserve any existing plugin directory and its private settings before replacing it; do not commit local credentials or settings to the repository. The runtime key remains `talk-desktop`. Backend enablement and the Desktop contribution's opt-in toggle are separate; loading the new backend may require a dashboard restart, and a remote Desktop needs the matching client file.
 
 ### Same-machine setup (manual)
 
@@ -100,7 +114,7 @@ The desktop app discovers the desktop half from the plugin folder
 ## First run
 
 1. The mic button appears in the composer (next to the `+` row). Click to start a call.
-2. Open the gear ⚙ for settings: **Bot → Voice engine → Voice → Audio**.
+2. Open the gear ⚙ for settings: **Voice language → Bot → Voice engine → Voice → Audio**. English is selected by default; language changes are unavailable during a call or connection attempt.
 3. If this is a fresh machine: sign in to Codex first (`codex login`) or use the in-panel session flow.
 
 ## Configuration

@@ -2,6 +2,7 @@
 import ast
 import asyncio
 import importlib.util
+import json
 import subprocess
 from types import SimpleNamespace
 
@@ -40,7 +41,7 @@ def test_tool_adapter_signature_compatibility(localized, language):
 
 def constants():
     tree = ast.parse(PLUGIN_API.read_text())
-    names = {'_LANGUAGE_DIRECTIVE_DEFAULT', '_AGENT_INSTR', '_AGENT_INSTR_SKIP', '_VOICE_POLICY'}
+    names = {'_LANGUAGE_DIRECTIVE_DEFAULT', '_LANGUAGE_DIRECTIVE_LEGACY', '_AGENT_INSTR', '_AGENT_INSTR_SKIP', '_VOICE_POLICY'}
     result = {n.targets[0].id: ast.literal_eval(n.value) for n in tree.body
             if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)
             and n.targets[0].id in names}
@@ -64,8 +65,8 @@ def test_language_directive_default_file_and_user_override(tmp_path, language):
     ns.update(constants(), _DIRECTIVE_PATH=REPO / 'language_directive.txt')
     expected = ns['_language_directive'](language)
     assert expected == ns['_LANGUAGE_DIRECTIVE_DEFAULT'][language]
-    assert ('natural Chilean Spanish' if language == 'en' else 'español natural de Chile') in expected
-    assert ('if they speak English, reply in English' if language == 'en' else 'si te habla en inglés, en inglés') in expected
+    assert ('clear, natural English' if language == 'en' else 'español claro y natural') in expected
+    assert 'Chile' not in expected
     ns['_DIRECTIVE_PATH'] = tmp_path / 'directive.txt'
     assert ns['_language_directive'](language) == expected
     ns['_DIRECTIVE_PATH'].write_text('')
@@ -78,10 +79,43 @@ def test_language_directive_default_file_and_user_override(tmp_path, language):
         assert ns['_language_directive'](language) == expected
 
 
+@pytest.mark.parametrize('language', [None, '', 'unknown', 'en-US', 'EN', 42])
+def test_language_directive_unspecified_or_unknown_is_english(tmp_path, language):
+    ns = load_unit(PLUGIN_API, '_language_directive')
+    ns.update(constants(), _DIRECTIVE_PATH=tmp_path / 'missing.txt')
+    assert ns['_language_directive'](language) == ns['_LANGUAGE_DIRECTIVE_DEFAULT']['en']
+    assert ns['_language_directive']() == ns['_LANGUAGE_DIRECTIVE_DEFAULT']['en']
+
+
+@pytest.mark.parametrize('language', ['es', 'es-CL', 'es_ES', ' ES '])
+def test_language_directive_explicit_spanish_is_preserved(tmp_path, language):
+    ns = load_unit(PLUGIN_API, '_language_directive')
+    ns.update(constants(), _DIRECTIVE_PATH=tmp_path / 'missing.txt')
+    assert ns['_language_directive'](language) == ns['_LANGUAGE_DIRECTIVE_DEFAULT']['es']
+
+
+@pytest.mark.parametrize('language', ['en', 'es'])
+def test_old_shipped_directives_migrate_but_similar_owner_text_does_not(tmp_path, language):
+    # Exact historical defaults from ab76f53:dashboard/plugin_api.py, independent of Git history.
+    old = json.loads((REPO / 'tests' / 'fixtures' / 'legacy_language_directives_ab76f53.json')
+                     .read_text(encoding='utf-8'))
+    path = tmp_path / 'directive.txt'
+    ns = load_unit(PLUGIN_API, '_language_directive')
+    ns.update(constants(), _DIRECTIVE_PATH=path)
+    expected = ns['_LANGUAGE_DIRECTIVE_DEFAULT'][language]
+    for text in [*old.values(), '\n\n'.join(v.strip() for v in old.values())]:
+        path.write_text(text + '\n')
+        assert ns['_language_directive'](language) == expected
+    custom = old['es'] + '\nOwner preference: preserve this exact wording.\n'
+    path.write_text(custom)
+    assert ns['_language_directive'](language) == '\n\n' + custom
+
+
 @pytest.mark.parametrize('profile', [None, 'example-bot'])
 @pytest.mark.parametrize('allow_chat', [False, True])
-@pytest.mark.parametrize('language', [None, 'es', 'en'])
+@pytest.mark.parametrize('language', [None, 'es', 'en', 'unknown', 'es-CL'])
 def test_constructed_voice_prompts(profile, allow_chat, language):
+    english = language not in ('es', 'es-CL')
     sections = {'PERSONA': 'Soy un bot de prueba.', 'MEMORY': 'El usuario vive en Chile.'}
     ns = load_unit(PLUGIN_API, '_mint_for')
     ns.update(constants())
@@ -106,23 +140,24 @@ def test_constructed_voice_prompts(profile, allow_chat, language):
     ns['_send_to_chat_tool'].__globals__['_SEND_TO_CHAT_DESC'] = 'Send work to the chat.'
     ns['_mint_for'](profile, 'marin', allow_chat, language)
     prompt = captured['instructions']
-    assert (('VOICE + CHAT:' if language == 'en' else 'VOZ + CHAT:') in prompt) == allow_chat
+    assert (('VOICE + CHAT:' if english else 'VOZ + CHAT:') in prompt) == allow_chat
     if allow_chat:
-        assert ('complete request phrased naturally in their language' if language == 'en' else 'petición completa y natural en su idioma') in prompt
-    assert ('LANGUAGE AND VOICE:' if language == 'en' else 'IDIOMA Y VOZ:') in prompt
+        assert ('complete request phrased naturally in their language' if english else 'petición completa y natural en su idioma') in prompt
+    assert ('LANGUAGE AND VOICE:' if english else 'IDIOMA Y VOZ:') in prompt
     assert 'Do NOT delegate greetings' in prompt
     assert all(text in prompt for text in sections.values())
     persona = load_unit(PLUGIN_API, '_codexlive_persona')
     persona.update(ns)
     prompt = persona['_codexlive_persona'](profile, language)
-    assert ('VOICE: You are speaking' if language == 'en' else 'VOZ: hablas') in prompt
-    assert ('IDENTITY: You are ' if language == 'en' else 'IDENTIDAD: eres ') + ('Example Bot' if profile else 'Host Bot') in prompt
+    assert ('VOICE: You are speaking' if english else 'VOZ: hablas') in prompt
+    assert ('IDENTITY: You are ' if english else 'IDENTIDAD: eres ') + ('Example Bot' if profile else 'Host Bot') in prompt
     assert all(text in prompt for text in sections.values())
 
 
-@pytest.mark.parametrize('mode', ['client', 'server'])
-@pytest.mark.parametrize('language', [None, 'es', 'en'])
+@pytest.mark.parametrize('mode', [None, 'client', 'server'])
+@pytest.mark.parametrize('language', [None, 'es', 'en', 'unknown', 'es-CL'])
 def test_codex_start_sends_localized_delegation_instructions(mode, language):
+    english = language not in ('es', 'es-CL')
     ns = load_unit(PLUGIN_API, '_codexlive_start')
     ns.update(constants())
     ns.update(_CL={'notifs': []}, _cl_ensure=lambda: None,
@@ -139,16 +174,18 @@ def test_codex_start_sends_localized_delegation_instructions(mode, language):
     ns['_cl_request'] = request
     ns['_codexlive_start'](None, 'cove', 'stub', language)
     instruction = captured['realtimeStartInstructions']
-    assert instruction.startswith('You are connected to a live voice session' if language == 'en' else 'Estás conectado a una sesión de voz en vivo')
-    if mode == 'client':
+    assert instruction.startswith('You are connected to a live voice session' if english else 'Estás conectado a una sesión de voz en vivo')
+    assert captured['clientManagedHandoffs'] is (mode != 'server')
+    if mode != 'server':
         assert '<realtime_delegation>' in instruction
-        assert ('do NOT read files: reply with only the word: skip' if language == 'en' else 'NO leas archivos: responde únicamente la palabra: skip') in instruction
+        assert ('do NOT read files: reply with only the word: skip' if english else 'NO leas archivos: responde únicamente la palabra: skip') in instruction
     else:
-        assert ('carry it out with your tools' if language == 'en' else 'actúala con tus herramientas') in instruction
+        assert ('carry it out with your tools' if english else 'actúala con tus herramientas') in instruction
 
 
-@pytest.mark.parametrize('language', [None, 'es', 'en'])
+@pytest.mark.parametrize('language', [None, 'es', 'en', 'unknown', 'es-CL'])
 def test_tool_timeout_and_dynamic_output(language):
+    english = language not in ('es', 'es-CL')
     ns = load_unit(PLUGIN_API, 'run_tool')
     output = 'Resultado original en español.'
 
@@ -167,9 +204,9 @@ def test_tool_timeout_and_dynamic_output(language):
 
     assert asyncio.run(ns['run_tool'](Request()))['output'] == output
     output = None
-    assert asyncio.run(ns['run_tool'](Request()))['output'].startswith('The tool example is still running;' if language == 'en' else 'La herramienta example sigue corriendo;')
+    assert asyncio.run(ns['run_tool'](Request()))['output'].startswith('The tool example is still running;' if english else 'La herramienta example sigue corriendo;')
     tools = vendor_module('talk_tools')
-    with pytest.raises(tools.TalkToolError, match="the voice tool 'example' is not available" if language == "en" else "la tool de voz 'example' no está disponible"):
+    with pytest.raises(tools.TalkToolError, match="the voice tool 'example' is not available" if english else "la tool de voz 'example' no está disponible"):
         tools.execute_talk_tool('example', {}, language)
 
 
@@ -312,9 +349,9 @@ def test_codex_thread_reuse_includes_language():
         return {'thread': {'id': str(len(calls))}}
     ns.update(_CL={}, _agent_model=lambda: None, Path=Path, _cl_request=request)
     ensure = ns['_cl_thread_ensure']
-    assert ensure() == ensure('es') == '1'
-    assert ensure('en') == ensure('en') == '2'
-    assert ensure('es') == '3'
+    assert ensure() == ensure(None) == ensure('unknown') == ensure('en') == '1'
+    assert ensure('es') == ensure('es-CL') == '2'
+    assert ensure('en') == '3'
 
 
 @pytest.mark.parametrize('english', [False, True])
@@ -332,7 +369,7 @@ def test_desktop_session_request_bodies(english):
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize('language', [None, 'es', 'en'])
+@pytest.mark.parametrize('language', [None, 'es', 'en', 'unknown', 'es-CL'])
 def test_tool_route_localizes_unavailable_error(language):
     ns = load_unit(PLUGIN_API, 'run_tool')
     class HTTPException(Exception):
@@ -344,4 +381,4 @@ def test_tool_route_localizes_unavailable_error(language):
             return {'name': 'probe', 'language': language}
     with pytest.raises(HTTPException) as exc:
         asyncio.run(ns['run_tool'](Request()))
-    assert ('the voice tool' if language == 'en' else 'la tool de voz') in exc.value.detail
+    assert ('la tool de voz' if language in ('es', 'es-CL') else 'the voice tool') in exc.value.detail

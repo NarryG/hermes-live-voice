@@ -1,32 +1,13 @@
 # Model context language
 
-The desktop uses its existing `EN` flag (`navigator.language` starts with `en`;
-otherwise Spanish). It sends `language: "en"` or `"es"` on `/session`,
-`/codexlive/session`, and `/tool`, including voice previews. The backend selects
-text per request. Missing or unrecognized language values use Spanish. Codex
-thread reuse includes the language so a different locale starts a new thread.
+This fork defaults to English independently of `navigator.language`. The Desktop gear menu contains an explicit **Voice language** preference, stored under `language.v1`. Only a saved `es` preference selects Spanish. Missing, unsupported or unreadable preferences keep English. Language cannot change while a call is active or being started.
 
-Localized text covers the chat prefix, spoken acknowledgement instruction,
-delegation results and statuses (including errors, timeouts, empty results,
-disabled tasks, queued work, and stale work), omitted-code marker, preview
-instruction and sample, backend persona and chat instructions, Codex delegation
-and skip instructions, language directive, and tool errors/timeouts. Protocol
-identifiers, including `skip` and `<realtime_delegation>`, remain unchanged.
+All `/session`, `/codexlive/session` and `/tool` requests carry `language: "en"` or `"es"`, including the currently hidden preview path. The backend selects each request independently; missing or unsupported values use English. Codex thread reuse includes language, so changing the explicit preference starts a thread with matching instructions rather than reusing Spanish context.
 
-`language_directive.txt` ships both defaults. The exact shipped bundle and the
-previous single-language defaults select the corresponding built-in alternative.
-Missing or blank files also use that alternative. Any other file content is a
-custom override and is included verbatim in either mode. Both defaults retain
-user-language matching and natural Chilean Spanish.
+The shipped defaults request English or neutral Spanish, with no inherited Chilean dialect or personal owner name. The exact old upstream single-language defaults and bundled `language_directive.txt` are treated as shipped defaults during migration. Missing or blank files use the selected built-in directive. Any different owner-authored file remains a verbatim custom override: the fork does not translate, rewrite or delete it. If a custom directive itself requests Spanish, that explicit content still controls the voice.
 
-This change localizes the Spanish model text addressed by PR #4. It does not
-translate the bundled generic English preamble, tool schemas, or existing English
-voice policy; only that policy's changed spoken example follows the flag.
-User requests, dynamic tool output, SOUL/persona source text, and memory are not
-translated. Existing voice cleanup and length limits still apply to chat results.
-The host bot behavior is unchanged; neither preview sample adds an owner's name.
+Localized model text includes the legacy chat prefix, spoken acknowledgement instruction, delegation results/statuses, omitted-code marker, preview instruction/sample, backend voice/persona wrappers, Codex delegation/skip instructions and tool errors/timeouts. Protocol identifiers such as `skip`, `<realtime_delegation>`, `LIVE_SIN_QUOTA` and `LIVE_HANDOFF_NO_SOPORTADO` are retained for compatibility; their explanations are English by default. Subscription errors do not change the saved engine or billing lane.
 
-Tests use production function extraction and Node evaluation with transport and
-host stubs. They do not call providers or use a microphone. Existing Codex
-capability fallback can omit prompts when an older server rejects those fields;
-the existing dropped-field report remains in place.
+Owner requests, dynamic tool output, `SOUL.md`/persona source text and memory are not translated. Existing identity sanitization remains in place; language wrappers must not replace the bot's identity. Backend profile discovery follows Hermes's resolved home rather than a literal `~/.hermes` path.
+
+Tests execute production functions and the real Desktop module with synthetic host/media/provider boundaries. They never sign in, open a microphone, call a provider, or prove spoken-English quality. An older Codex app-server can reject optional prompt fields; the existing dropped-field warning remains, and a prompt omitted by protocol negotiation cannot be claimed to have affected the provider.

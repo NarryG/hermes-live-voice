@@ -36,9 +36,12 @@ def load_unit(path: Path, name: str) -> dict:
     assert len(nodes) == 1, f"expected exactly one {name} in {path}"
     node = nodes[0]
     node.decorator_list = []
+    # Include this pure locale dependency when present; all I/O stays stubbed.
+    helpers = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+               and n.name == '_session_language' and n is not node]
     unit = ast.Module(
         body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")],
-                             level=0), node],
+                             level=0), *helpers, node],
         type_ignores=[],
     )
     ast.fix_missing_locations(unit)
@@ -164,8 +167,8 @@ def _start_ns(delegation, errors):
     ns["_cl_thread_ensure"] = lambda language: "tid-1"
     ns["_codexlive_persona"] = lambda profile, language: "persona"
     ns["_talk_settings"] = lambda: {"delegation": delegation}
-    ns["_AGENT_INSTR"] = {"es": "agent"}
-    ns["_AGENT_INSTR_SKIP"] = {"es": "skip"}
+    ns["_AGENT_INSTR"] = {"es": "agent", "en": "agent"}
+    ns["_AGENT_INSTR_SKIP"] = {"es": "skip", "en": "skip"}
     sent: list[dict] = []
     pending = list(errors)
 
@@ -224,7 +227,7 @@ def test_codexlive_start_error_naming_other_field_does_not_drop_scheduled_one():
 
 def test_codexlive_start_unparseable_unknown_field_raises_without_dropping():
     ns, sent = _start_ns("client", ["unknown field", "unknown field"])
-    with pytest.raises(RuntimeError, match="rechaz"):
+    with pytest.raises(RuntimeError, match="rejected"):
         ns["_codexlive_start"](None, "cove", "v=0")
     assert len(sent) == 1
 

@@ -164,9 +164,7 @@ def test_scanner_flags_untranslated_literal():
 
 
 def test_language_fallback_is_english():
-    """#12: with no navigator.language the global catalog must default to English."""
+    """The fork starts in English, without inferring speech from the browser locale."""
     src = _src()
-    m = re.search(r"^const EN = .*$", src, re.M)
-    assert m, "const EN not found"
-    assert "navigator.language) || 'en')" in m.group(0)
-    assert "|| 'es'" not in m.group(0)
+    assert "let EN = true" in src
+    assert "navigator.language" not in src

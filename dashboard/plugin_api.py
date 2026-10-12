@@ -800,7 +800,7 @@ def _cl_ensure() -> None:
         return
     binary = _codex_binary()
     if not binary:
-        raise RuntimeError("codex no encontrado (PATH del servicio sin ~/.npm-global/bin)")
+        raise RuntimeError("Codex CLI was not found in the service PATH or its supported installation directories")
     env = os.environ.copy()
     env["PATH"] = (str(Path.home() / ".npm-global" / "bin") + ":" + env.get("PATH", "")).strip(":")
     # clave: la lane de voz usa la SUSCRIPCIÓN (auth.json), no una API key de entorno

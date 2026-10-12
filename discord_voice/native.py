@@ -4,6 +4,7 @@ import inspect
 import json
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Literal
 
@@ -35,6 +36,74 @@ def owner_home(adapter):
         return Path(get_process_hermes_home()).resolve()
     from hermes_cli.profiles import get_profile_dir
     return Path(get_profile_dir(profile)).resolve()
+
+
+REGISTRATION_TIMEOUT = 60.0
+
+
+class PendingNativeHandle:
+    """Wait on registry publication, never infer ownership from ambient context."""
+    def __init__(self, native, adapter, home, selected_capture):
+        self.native = native
+        self.adapter = adapter
+        self.home = home
+        self.selected_capture = selected_capture
+        self.loop = asyncio.get_running_loop()
+        self.handle = None
+        self.closed = threading.Event()
+        self.lock = threading.Lock()
+        async def disconnect():
+            self.shutdown()
+        self.disconnect = disconnect
+        native.add_listener(disconnect, 'on_disconnect')
+        self.ready = asyncio.create_task(self.initialize())
+
+    async def initialize(self):
+        try:
+            async with asyncio.timeout(REGISTRATION_TIMEOUT):
+                while True:
+                    with self.lock:
+                        if (self.closed.is_set() or self.adapter._client is not self.native
+                                or getattr(self.adapter, '_disconnecting', False)
+                                or self.native.is_closed()):
+                            return
+                        if self.adapter.gateway_runner._owning_profile(self.adapter, self.adapter.platform)[0]:
+                            if Path(self.home).resolve() != owner_home(self.adapter):
+                                raise ValueError('Adapter profile home mismatch.')
+                            host_sync = getattr(self.adapter, '_post_connect_task', None)
+                            if host_sync is None or host_sync.done():
+                                if host_sync is not None:
+                                    host_sync.result()  # fail closed if host registration failed
+                                # install revalidates exact registered profile/home/native.
+                                # No await between ownership validation and publication.
+                                self.handle = install(self.native, self.adapter, self.home,
+                                                      selected_capture=self.selected_capture)
+                                return
+                    await asyncio.sleep(.01)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                'Live Voice native registration failed or timed out; owning gateway restart required.')
+        finally:
+            self.native.remove_listener(self.disconnect, 'on_disconnect')
+
+    def shutdown(self):
+        # Fence immediately, including unload from a non-gateway thread. Serialize
+        # handle publication so a concurrent unload cannot lose an installed handle.
+        self.closed.set()
+        with self.lock:
+            if self.handle is not None:
+                self.handle.shutdown()
+        if not self.loop.is_closed():
+            self.loop.call_soon_threadsafe(self.cancel_pending)
+
+    def cancel_pending(self):
+        self.native.remove_listener(self.disconnect, 'on_disconnect')
+        if not self.ready.done():
+            self.ready.cancel()
+
+
+def defer_install(native, adapter, home, *, selected_capture=None):
+    return PendingNativeHandle(native, adapter, home, selected_capture)
 
 
 class NativeHandle:

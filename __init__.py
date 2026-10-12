@@ -18,11 +18,14 @@ def register(ctx) -> None:
     def discord_factory(native, adapter):
         if unloaded.is_set():
             return
-        from .discord_voice.native import install
-        # Factory executes in the supplied adapter's profile context, not the
-        # Desktop selected bot context. Only its own persona file may be read.
-        handle = install(native, adapter, home=home, selected_capture=selected_capture)
+        from .discord_voice.native import defer_install
+        # Defer all owner-file reads until the gateway publishes this exact
+        # adapter; ambient Desktop selection is never ownership evidence.
+        handle = defer_install(native, adapter, home=home, selected_capture=selected_capture)
         handles.append(handle)
+        # Unload may run on another thread while the factory creates the handle.
+        if unloaded.is_set():
+            handle.shutdown()
 
     def unload():
         unloaded.set()

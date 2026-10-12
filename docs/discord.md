@@ -141,6 +141,9 @@ no cache mutation, playback monkeypatch or core change is used here.
 aiortc 1.15.0, PyAV 17.1.0, aiohttp 3.x and Discord.py 2.7.1 with voice extras.
 The source plugin still requires the existing Hermes native Discord host APIs and
 receiver. An installer must verify those APIs/dependencies on its own host.
+See [voice dependency bootstrap](voice-dependencies.md) for the read-only native
+codec/ffmpeg preflight, explicit administrator provisioning, Hermes PM Python
+dependency admission, and durable container image prerequisites.
 
 ```sh
 python -m pip install '.[test]'

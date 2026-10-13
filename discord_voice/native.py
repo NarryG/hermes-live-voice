@@ -173,6 +173,7 @@ class NativeHandle:
         except (OSError, ValueError):
             settings = {}
         language, voice = normalize_settings(settings)
+        logger.warning('Live Voice: settings resolved language=%s voice=%s (from %s)', language, voice, settings_path)
         # Persona only, NEVER USER/MEMORY/WORKING, Desktop session or task state.
         try:
             from .owner import _file

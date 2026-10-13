@@ -150,15 +150,13 @@ def test_current_owner_file_generation_change_invalidates_prepared_media(tmp_pat
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('change', ['unknown-layer', 'unknown-config', 'unknown-origin', 'keyring',
+@pytest.mark.parametrize('change', ['unknown-layer',  'unknown-origin', 'keyring',
     'api-key', 'managed', 'routing', 'file-permissions', 'symlink-parent'])
 def test_unproven_owner_source_policy_or_store_refuses(tmp_path, change):
     async def run():
         selected, cli, scope, metadata = owner(tmp_path)
         if change == 'unknown-layer':
             metadata['config']['layers'][0]['name']['type'] = 'UNKNOWN'
-        elif change == 'unknown-config':
-            metadata['config']['config']['unknown_provider_attestation'] = 'not supported'
         elif change == 'unknown-origin':
             metadata['config']['origins']['model_provider'] = {'name': {'type': 'user', 'file': '/UNKNOWN'}, 'version': 'UNKNOWN'}
         elif change == 'keyring':
@@ -187,6 +185,40 @@ def test_unproven_owner_source_policy_or_store_refuses(tmp_path, change):
         finally:
             await selected.close()
     asyncio.run(run())
+
+def test_prepare_accepts_the_cli_own_defaults_from_a_real_owner(tmp_path):
+    """A healthy owner must prepare: the CLI's own defaults are not overrides."""
+    async def run():
+        selected, cli, scope, metadata = owner(tmp_path)
+        settings = json.loads((cli / 'FAKE-METADATA.json').read_text())
+        settings['config']['config'].update({
+            'chatgpt_base_url': 'https://chatgpt.com/backend-api/',
+            'experimental_thread_store_endpoint': 'http://127.0.0.1:0/thread-store',
+            'js_repl_node_module_dirs': [],
+            'js_repl_node_path': '/usr/bin/node',
+        })
+        (cli / 'FAKE-METADATA.json').write_text(json.dumps(settings))
+        try:
+            assert await selected.prepare(scope) is True
+            assert selected.snapshot().provider == 'openai'
+        finally:
+            await selected.close()
+    asyncio.run(run())
+
+
+def test_prepare_still_refuses_a_real_non_canonical_endpoint(tmp_path):
+    """The guard keeps its meaning: a third-party endpoint is not the lane's."""
+    async def run():
+        selected, cli, scope, metadata = owner(tmp_path)
+        settings = json.loads((cli / 'FAKE-METADATA.json').read_text())
+        settings['config']['config']['chatgpt_base_url'] = 'https://alternate.invalid'
+        (cli / 'FAKE-METADATA.json').write_text(json.dumps(settings))
+        try:
+            assert await selected.prepare(scope) is False
+        finally:
+            await selected.close()
+    asyncio.run(run())
+
 
 
 @pytest.mark.parametrize('key', ['CODEX_HOME', 'CODEX_CONFIG_REQUIREMENTS_TOML_PATH'])

@@ -269,6 +269,12 @@ class SessionManager:
         self.scope: AdapterScope | None = None  # Captured at native registration.
         self.scope_guard: Callable[[], bool] | None = None
 
+    def refusal_message(self, tail):
+        """Name the cause: a bare "preflight refused" hid a working owner."""
+        reason = getattr(self.lane_factory, 'refusal_reason', None)
+        detail = ' [%s]' % reason if isinstance(reason, str) and reason else ''
+        return 'Voice unavailable: selected CLI owner/config preflight refused%s. %s' % (detail, tail)
+
     async def preflight(self):
         check: Any = getattr(self.lane_factory, 'preflight', None)
         if getattr(self.lane_factory, 'admitted', False) is not True or not callable(check):
@@ -440,7 +446,7 @@ class SessionManager:
                 if not session.consent_ready():
                     return 'Every current human participant must consent to this call and audience.'
                 if not await self.preflight():
-                    return 'Voice unavailable: selected CLI owner/config preflight refused. No provider was started.'
+                    return self.refusal_message('No provider was started.')
                 if self.closed.is_set():
                     return 'Voice manager closed; gateway restart required.'
                 try:
@@ -471,7 +477,7 @@ class SessionManager:
                 return message
             self.start_disclosure = None
             if not await self.preflight():
-                return 'Voice unavailable: selected CLI owner/config preflight refused. No Discord connection or provider was started.'
+                return self.refusal_message('No Discord connection or provider was started.')
             if self.closed.is_set():
                 return 'Voice manager closed; gateway restart required.'
             try:

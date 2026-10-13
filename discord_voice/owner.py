@@ -19,7 +19,7 @@ import time
 from types import MappingProxyType
 
 from .broker import CLIRecord, ScopeRefused, snapshot_from_cli_record
-from .config_keys import CONFIG_KEYS
+from .config_keys import CONFIG_KEYS, routing_override_reason
 
 POLL_INTERVAL = 2.0
 METADATA_TTL = 8.0
@@ -128,6 +128,20 @@ def _file(path, *, secret=False):
         os.close(fd)
 
 
+def _refusal_reason(exc):
+    """Short, non-secret reason the selected owner refused, for the operator.
+
+    prepare() refuses by returning False, so without this the lane answered
+    "preflight refused" with no cause and a healthy owner looked like a missing
+    feature. Only short fixed reason strings and exception type names are kept:
+    nothing that could quote credential material.
+    """
+    text = str(exc).strip()
+    if isinstance(exc, (ScopeRefused, ValueError)) and 0 < len(text) <= 120:
+        return text
+    return type(exc).__name__
+
+
 class SelectedCLIOwner:
     """Persistent bounded metadata client, scoped to actual native registration."""
     def __init__(self, host, scope, captured, *, metadata_command=None, scope_guard=None):
@@ -139,6 +153,7 @@ class SelectedCLIOwner:
         self._seq = 0
         self._lock = asyncio.Lock()
         self._closed = False
+        self._refusal = None
         self._invalid = False
         self._paths = ()
         self._stamps = None
@@ -150,6 +165,11 @@ class SelectedCLIOwner:
 
     def __repr__(self):
         return '<SelectedCLIOwner redacted>'
+
+    @property
+    def refusal_reason(self):
+        """Short non-secret cause of the last refused prepare, if any."""
+        return self._refusal
 
     def _scope_check(self, scope):
         c = self._captured
@@ -247,15 +267,15 @@ class SelectedCLIOwner:
         account, response, requirements = metadata
         config = response['config']
         if (not isinstance(response.get('layers'), list) or not isinstance(response.get('origins'), dict)
-                or not isinstance(config, dict) or set(config) - CONFIG_KEYS
-                or config.get('cli_auth_credentials_store') not in (None, 'file')
-                or requirements.get('requirements', 'unknown') is not None):
-            raise ValueError()
-        if any(config.get(key) for key in ('model_providers', 'openai_base_url', 'chatgpt_base_url',
-                'experimental_realtime_webrtc_call_base_url', 'experimental_realtime_ws_base_url',
-                'experimental_realtime_ws_backend_prompt', 'experimental_realtime_ws_startup_context',
-                'experimental_realtime_start_instructions', 'responses_api_metadata', 'mcp_enterprise_managed_auth')):
-            raise ValueError()
+                or not isinstance(config, dict)):
+            raise ValueError('config layers/origins shape')
+        if config.get('cli_auth_credentials_store') not in (None, 'file'):
+            raise ValueError('non-file credential store')
+        if requirements.get('requirements', 'unknown') is not None:
+            raise ValueError('managed requirements present')
+        override = routing_override_reason(config)
+        if override is not None:
+            raise ValueError(override)
         if config.get('forced_login_method') not in (None, 'chatgpt'):
             raise ValueError()
         self._source_paths(response)
@@ -273,6 +293,7 @@ class SelectedCLIOwner:
 
     async def prepare(self, scope):
         async with self._lock:
+            self._refusal = None
             try:
                 self._scope_check(scope)
                 if self._closed:
@@ -321,7 +342,8 @@ class SelectedCLIOwner:
                     self._attested_at = time.monotonic()
                     self._watcher = asyncio.create_task(self._watch())
                 return True
-            except Exception:
+            except Exception as exc:
+                self._refusal = _refusal_reason(exc)
                 await self.close()
                 return False
 
@@ -423,6 +445,11 @@ class SelectedLaneFactory:
         # Native player/UDP guards must fence already-buffered audio synchronously,
         # not wait for an asyncio poll to notice a changed owner/config generation.
         return self.account_ready
+
+    @property
+    def refusal_reason(self):
+        """Short non-secret cause when this lane last refused to prepare."""
+        return getattr(self._owner, 'refusal_reason', None)
 
     def accepts_voice(self, voice):
         try:

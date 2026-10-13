@@ -5,6 +5,7 @@ The registered native host supplies one atomic *already selected* CLI snapshot.
 This is an in-process capability API, not a route or user-argument attestation.
 """
 from dataclasses import dataclass
+from .config_keys import routing_override_reason
 
 # Codex 0.162.1 RealtimeVoicesList.v1 is also the V3 admitted voice set.
 V3_VOICES = frozenset(('juniper', 'maple', 'spruce', 'ember', 'vale', 'breeze', 'arbor', 'sol', 'cove'))
@@ -86,10 +87,8 @@ def snapshot_from_cli_record(record):
             raise ValueError()
         config = json.loads(config_json)
         desktop = record.consumer_source == 'desktop-v3/pinned-codex-0.162.1'
-        if (config.get('model_provider') not in ((None, 'openai') if desktop else ('openai',)) or config.get('model_providers')
-                or config.get('chatgpt_base_url') or config.get('experimental_realtime_ws_base_url')
-                or config.get('experimental_realtime_ws_backend_prompt')
-                or config.get('agent_identity_authapi_base_url')):
+        if (config.get('model_provider') not in ((None, 'openai') if desktop else ('openai',))
+                or routing_override_reason(config) is not None):
             raise ValueError()
         realtime = config.get('realtime') or {} if desktop else config['realtime']
         if (not isinstance(realtime, dict)

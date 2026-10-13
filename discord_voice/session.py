@@ -462,6 +462,12 @@ class SessionManager:
             if self.closed.is_set():
                 return 'Voice manager closed; gateway restart required.'
             if operation == 'stop':
+                # A session can be left under a differently-shaped key after a restart or a
+                # half-finished cleanup; with one live session that is unambiguous, and leaving it
+                # behind is what makes every later start answer 'already reserved'.
+                live = [s for s in self.sessions.values() if getattr(s, 'state', None) != 'stopped']
+                if len(live) == 1:
+                    session = live[0]
                 if not session:
                     return 'Voice stopped.'
                 ack = await self.finish(session)

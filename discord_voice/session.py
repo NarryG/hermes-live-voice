@@ -2,6 +2,7 @@
 import asyncio
 import contextvars
 import queue
+import logging
 import threading
 import time
 import uuid
@@ -16,6 +17,8 @@ from .receiver import new_receiver
 
 _OVERALL_CAPACITY = threading.BoundedSemaphore(4)
 
+
+logger = logging.getLogger(__name__)
 
 class AdapterScope(NamedTuple):
     home: Path

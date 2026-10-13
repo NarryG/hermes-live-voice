@@ -1,6 +1,7 @@
 """Direct V3 media/control consumer. No backing agent, tools or sideband auth."""
 import asyncio
 import json
+import logging
 import queue
 from dataclasses import dataclass
 from fractions import Fraction
@@ -11,6 +12,8 @@ from aiortc.mediastreams import MediaStreamError
 
 from .broker import ScopeRefused, validate_sdp
 
+
+logger = logging.getLogger(__name__)
 
 class MediaRefused(RuntimeError):
     pass

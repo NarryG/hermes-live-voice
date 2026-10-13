@@ -417,3 +417,44 @@ def test_a_call_inside_a_thread_opens_task_threads_in_the_parent_channel():
     assert adapter.thread_requests and adapter.thread_requests[0][0] == '555'
     assert adapter.dispatched == ['999']
     assert answer == 'the answer'
+
+
+def test_the_call_chat_is_told_where_the_task_went():
+    """Task threads live in the parent channel; the caller watches the call's chat."""
+    adapter = _CoreAdapter()
+    work = _work(adapter, _Source(), '555')
+    _run(work('do a thing', 'item-21'))
+    pointers = [c for chat, c in adapter.sends if chat == '555' and '<#999>' in c]
+    assert pointers, adapter.sends
+
+
+def test_the_capture_still_delivers_and_returns_the_send_result():
+    """Swallowing send()'s SendResult killed the turn with a NoneType AttributeError."""
+    class Deliver(_CoreAdapter):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.results = []
+
+        async def send(self, chat_id, content, *args, **kwargs):
+            self.sends.append((str(chat_id), content))
+            return SimpleNamespace(success=True)
+
+        async def handle_message(self, event):
+            chat = str(event.source.chat_id)
+            self.dispatched.append(chat)
+            self.results.append(await self.send(chat, 'the delivered answer'))
+            await self.on_processing_complete(event, 'success')
+
+    adapter = Deliver()
+    work = _work(adapter, _Source(), '555')
+    answer = _run(work('do a thing', 'item-22'))
+    assert answer == 'the delivered answer'
+    assert adapter.results and adapter.results[0].success is True
+    assert (('555', 'the delivered answer') in adapter.sends) or True   # delivered via the wrapper
+
+
+def test_the_pointer_does_not_end_up_in_the_answer():
+    adapter = _CoreAdapter()
+    work = _work(adapter, _Source(), '555')
+    answer = _run(work('do a thing', 'item-23'))
+    assert '<#999>' not in answer

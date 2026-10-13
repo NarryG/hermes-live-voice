@@ -27,11 +27,14 @@ _NO_TASK_PROMPT = (
 
 _DELEGATING_PROMPT = (
     'Voice conversation only. You have no tools of your own: when the caller asks you to DO something '
-    '(check, find, look up, run, make, fix, send, remember), delegate it. The backend runs it with its own '
-    'tools in this channel and posts the result back to you, and you read it aloud. Give one short '
-    'acknowledgement, then stay quiet until the result arrives; never invent a result, never claim success '
-    'before the result arrives, and do not delegate the same request twice. Greetings, acknowledgements and '
-    'small talk you answer yourself.'
+    '(check, find, look up, run, make, fix, send, remember), delegate it -- several at once is fine. The '
+    'backend runs each one with its own tools in its own thread and hands you the result as soon as that '
+    'task finishes; you read it aloud in a sentence or two. '
+    'Do NOT go quiet and do NOT wait for tasks to finish before talking: after one short acknowledgement '
+    '(and, when asked, one line saying how many are running) keep the conversation going. Results arrive '
+    'whenever they arrive, in whatever order they finish, and you announce each one then. Never invent a '
+    'result, never claim success before a result arrives, and never delegate the same request twice. '
+    'Greetings, acknowledgements and small talk you answer yourself.'
 )
 
 
@@ -221,31 +224,53 @@ class NativeHandle:
             adapter._client is native and self.manager.scope_guard())
         self.manager.lane_factory = SelectedLaneFactory(owner, delegation=delegation)
 
+async def respond_to_command(interaction, operation, manager, *, logger=logger):
+    """Acknowledge Discord's interaction first, then answer with the outcome.
+
+    Discord expires an unacknowledged interaction after three seconds and shows
+    "The application did not respond". The acknowledgement is therefore best effort and
+    the answer goes through the follow-up, which still works after expiry -- a slow
+    authorization step must not turn into a silent command.
+    """
+    deferred = False
+    try:
+        await interaction.response.defer(ephemeral=True)
+        deferred = True
+    except Exception:
+        logger.warning('Live Voice: could not acknowledge /livevoice %s (likely expired)', operation,
+                       exc_info=True)
+    try:
+        message = await manager.command(interaction, operation)
+    except Exception:
+        logger.warning('Live Voice: /livevoice %s raised', operation, exc_info=True)
+        message = 'Voice operation failed; status is unknown. No upstream details are disclosed.'
+    logger.warning('Live Voice: /livevoice %s by user=%s -> %s', operation,
+                   getattr(getattr(interaction, 'user', None), 'id', '?'), message)
+    try:
+        await interaction.followup.send(message, ephemeral=True)
+        return message
+    except Exception:
+        logger.warning('Live Voice: could not deliver the /livevoice %s reply (acknowledged=%s)',
+                       operation, deferred, exc_info=True)
+        return message
+
+
         async def livevoice(interaction: discord.Interaction,
                             operation: Literal['start', 'pause', 'resume', 'stop', 'status', 'consent', 'revoke']):
             if self.closed or self.manager.closed.is_set():
                 return
             # Native admission BEFORE defer. Manager checks gateway/source/owner too.
-            if not await adapter._check_slash_authorization(interaction, '/livevoice'):
-                return
-            if self.closed or self.manager.closed.is_set():
-                return
-            await interaction.response.defer(ephemeral=True)
             try:
-                message = await self.manager.command(interaction, operation)
+                if not await adapter._check_slash_authorization(interaction, '/livevoice'):
+                    return
             except Exception:
-                logger.warning('Live Voice: /livevoice %s raised', operation, exc_info=True)
-                message = 'Voice operation failed; status is unknown. No upstream details are disclosed.'
-            # The reply is the only user-visible outcome; without it a silent lane
-            # and a refusing lane look identical in the logs.
-            # WARNING, not INFO: the plugin's logger only reaches the log files at
-            # WARNING in this deployment, and this line is the only record of the
-            # user-visible outcome.
-            logger.warning('Live Voice: /livevoice %s by user=%s -> %s', operation,
-                           getattr(getattr(interaction, 'user', None), 'id', '?'), message)
+                logger.warning('Live Voice: /livevoice %s authorization raised', operation, exc_info=True)
+                return
             if self.closed or self.manager.closed.is_set():
                 return
-            await interaction.followup.send(message, ephemeral=True)
+            # The reply is the only user-visible outcome; without it a silent lane and a
+            # refusing lane look identical in the logs (see respond_to_command).
+            await respond_to_command(interaction, operation, self.manager)
 
         self.command = app_commands.Command(name='livevoice', description='Consented live voice: start, consent, revoke and owner controls', callback=livevoice)
         self.listeners = []

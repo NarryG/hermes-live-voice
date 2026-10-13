@@ -15,7 +15,7 @@ dependencies = [
   "aiohttp>=3.13,<4",
   "discord.py[voice]==2.7.1",
   # Discord voice requires DAVE (E2EE); older davey drops incoming audio.
-  "davey>=0.1.7",
+  "davey==0.1.7",
 ]
 
 [project.optional-dependencies]

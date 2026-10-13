@@ -144,17 +144,32 @@ class ChatWork:
         self.event_factory = event_factory or core_message_event
         self.threads = {}
         self.outcome = None
+        self._sent = None
+        self._edited = None
         self._chat = self.chat_id
         self._parts = []
 
     async def _capture(self, chat_id, content, *args, **kwargs):
-        # Drop-in for adapter.send, which callers await.
+        """Observe the answer AND deliver it.
+
+        The gateway's delivery path uses the value ``send`` returns (a SendResult); an
+        observer that swallows it makes the turn die with
+        "'NoneType' object has no attribute 'success'" and the answer never reaches the
+        chat at all.
+        """
+        result = await self._sent(chat_id, content, *args, **kwargs)
         if str(chat_id) == self._chat and isinstance(content, str) and content.strip():
             self._parts.append(content.strip())
+        return result
 
     async def _capture_edit(self, chat_id, message_id, content=None, *args, **kwargs):
         # edit_message(chat_id, message_id, content) -- content is the third argument.
-        await self._capture(chat_id, content)
+        result = None
+        if self._edited is not None:
+            result = await self._edited(chat_id, message_id, content, *args, **kwargs)
+        if str(chat_id) == self._chat and isinstance(content, str) and content.strip():
+            self._parts.append(content.strip())
+        return result
 
     async def _seed(self, chat_id, text):
         """Show the caller what was asked, so the thread reads on its own."""
@@ -192,6 +207,12 @@ class ChatWork:
         self.threads[str(item_id)] = thread_id
         logger.warning('Live Voice: task %s runs in thread %s', item_id, thread_id)
         await self._seed(thread_id, text)
+        # Say WHERE, in the chat the caller is actually watching: task threads are opened
+        # in the parent channel, which is a different place from the call's own thread.
+        try:
+            await self.adapter.send(self.chat_id, '\N{STUDIO MICROPHONE} on it in <#%s>' % thread_id)
+        except Exception:
+            logger.warning('Live Voice: could not point at task thread %s', thread_id, exc_info=True)
         return thread_id
 
     def _session_key(self, source):
@@ -267,6 +288,7 @@ class ChatWork:
         event = self.event_factory(str(text), source)
         session_key = self._session_key(source)
         send, edit = self.adapter.send, getattr(self.adapter, 'edit_message', None)
+        self._sent, self._edited = send, edit
         self._chat, self._parts, self.outcome = chat_id, [], None
         self.adapter.send = self._capture
         if edit is not None:

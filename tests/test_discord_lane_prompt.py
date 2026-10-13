@@ -26,3 +26,10 @@ def test_the_default_lane_still_refuses_task_state():
 ])
 def test_the_delegation_setting_is_read_leniently(settings, expected):
     assert delegation_mode(settings) == expected
+
+
+def test_the_delegating_lane_keeps_talking_while_tasks_run():
+    prompt = lane_prompt('Buffer', 'persona', 'English', 'server')
+    assert 'Do NOT go quiet' in prompt
+    assert 'keep the conversation going' in prompt
+    assert 'several at once' in prompt

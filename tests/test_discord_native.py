@@ -431,3 +431,92 @@ def test_native_registration_uses_existing_bot_and_removes_only_own_handlers(tmp
         assert not native.extra_events['on_voice_state_update']
         await native.close()
     asyncio.run(scenario())
+
+
+class _Resp:
+    def __init__(self):
+        self.deferred = 0
+
+    async def defer(self, **kwargs):
+        self.deferred += 1
+
+
+class _Follow:
+    def __init__(self, fail=False):
+        self.sent = []
+        self.fail = fail
+
+    async def send(self, content, **kwargs):
+        if self.fail:
+            raise RuntimeError('expired')
+        self.sent.append(content)
+
+
+class _Interaction:
+    def __init__(self, defer_fails=False, follow_fails=False):
+        self.response = _Resp()
+        self.followup = _Follow(fail=follow_fails)
+        self.user = type('U', (), {'id': 42})()
+        self._defer_fails = defer_fails
+
+    async def _defer(self, **kwargs):
+        if self._defer_fails:
+            raise RuntimeError('Unknown interaction')
+        return await self.response.defer(**kwargs)
+
+
+def test_the_command_acknowledges_before_doing_the_work():
+    import asyncio
+
+    from discord_voice.native import respond_to_command
+
+    class Manager:
+        async def command(self, interaction, operation):
+            assert interaction.response.deferred == 1, 'must acknowledge before working'
+            return 'Voice started.'
+
+    interaction = _Interaction()
+
+    async def defer(**kwargs):
+        await _Interaction._defer(interaction, **kwargs)
+
+    interaction.response.defer = defer
+    message = asyncio.run(respond_to_command(interaction, 'start', Manager()))
+    assert message == 'Voice started.'
+    assert interaction.followup.sent == ['Voice started.']
+
+
+def test_an_expired_interaction_still_gets_its_answer():
+    import asyncio
+
+    from discord_voice.native import respond_to_command
+
+    class Manager:
+        async def command(self, interaction, operation):
+            return 'Voice started.'
+
+    interaction = _Interaction(defer_fails=True)
+
+    async def defer(**kwargs):
+        raise RuntimeError('Unknown interaction')
+
+    interaction.response.defer = defer
+    message = asyncio.run(respond_to_command(interaction, 'start', Manager()))
+    assert message == 'Voice started.'
+    assert interaction.followup.sent == ['Voice started.']
+
+
+def test_a_raising_command_never_leaks_details():
+    import asyncio
+
+    from discord_voice.native import respond_to_command
+
+    class Manager:
+        async def command(self, interaction, operation):
+            raise RuntimeError('fixture PRIVATE SECRET')
+
+    interaction = _Interaction()
+    message = asyncio.run(respond_to_command(interaction, 'start', Manager()))
+    assert 'PRIVATE SECRET' not in message
+    assert message.startswith('Voice operation failed')
+    assert interaction.followup.sent == [message]

@@ -19,6 +19,32 @@ logger = logging.getLogger(__name__)
 # no-ops when the loader picked a stale same-id directory, and nothing said so.
 logger.warning('Live Voice: native lane module loaded from %s', __file__)
 
+_NO_TASK_PROMPT = (
+    'Voice conversation only. No task continuity or tools are available in this call. '
+    'If asked to execute a task or access private task state, say that this lane cannot do it; '
+    'ask the caller to use their authenticated Hermes text session. Never delegate or claim task success.'
+)
+
+_DELEGATING_PROMPT = (
+    'Voice conversation only. You have no tools of your own: when the caller asks you to DO something '
+    '(check, find, look up, run, make, fix, send, remember), delegate it. The backend runs it with its own '
+    'tools in this channel and posts the result back to you, and you read it aloud. Give one short '
+    'acknowledgement, then stay quiet until the result arrives; never invent a result, never claim success '
+    'before the result arrives, and do not delegate the same request twice. Greetings, acknowledgements and '
+    'small talk you answer yourself.'
+)
+
+
+def delegation_mode(settings):
+    """'server' lets the backend execute what the call asks for; 'client' is the default."""
+    raw = (settings if isinstance(settings, dict) else {}).get('delegation')
+    return 'server' if str(raw or 'client').strip().lower() == 'server' else 'client'
+
+
+def lane_prompt(identity, persona, language, delegation):
+    head = 'IDENTITY: You are ' + identity + '.\n' + persona + '\nSpeak ' + str(language) + '. Keep replies brief. '
+    return head + (_DELEGATING_PROMPT if delegation == 'server' else _NO_TASK_PROMPT)
+
 
 def normalize_settings(settings):
     settings = settings if isinstance(settings, dict) else {}
@@ -182,10 +208,9 @@ class NativeHandle:
             persona = ''
         persona = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', persona)
         identity = getattr(native.user, 'display_name', None) or getattr(native.user, 'name', None) or 'Hermes'
-        prompt = 'IDENTITY: You are ' + identity + '.\n' + persona + '\nSpeak ' + str(language) + '. Keep replies brief. '
-        prompt += ('Voice conversation only. No task continuity or tools are available in this call. '
-                   'If asked to execute a task or access private task state, say that this lane cannot do it; '
-                   'ask the caller to use their authenticated Hermes text session. Never delegate or claim task success.')
+        delegation = delegation_mode(settings)
+        prompt = lane_prompt(identity, persona, language, delegation)
+        logger.warning('Live Voice: lane prompt mode=%s', delegation)
         self.manager = SessionManager(native, adapter, receiver_class, prompt=prompt, voice=voice)
         self.manager.scope = scope
         self.manager.scope_guard = lambda: (owner_home(adapter) == scope.home

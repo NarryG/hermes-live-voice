@@ -85,7 +85,7 @@ class DelegationQueue:
             answer = FAILED_TEXT
             try:
                 logger.warning('Live Voice: delegation started item=%s', item_id)
-                result = await asyncio.wait_for(self._run(text), self._timeout)
+                result = await asyncio.wait_for(self._run(text, item_id), self._timeout)
                 answer = speakable(result) or FAILED_TEXT
             except asyncio.TimeoutError:
                 answer = TIMEOUT_TEXT
@@ -101,33 +101,80 @@ class DelegationQueue:
                 logger.exception('Live Voice: could not append delegation result item=%s', item_id)
 
 
-class ChatWork:
-    """Runs a delegated request in the chat the call belongs to.
+def core_message_event(text, source):
+    """The core's inbound event type; imported here so the module stays importable alone."""
+    from gateway.platforms.event import MessageEvent
 
-    Dispatches through the adapter's own inbound path, so the work inherits the
-    channel's or thread's normal session, tools and permissions, and captures the
-    reply from the adapter's outbound ``send`` for that chat only.
+    return MessageEvent(text=text, source=source,
+                        user_id=getattr(source, 'user_id', None),
+                        user_name=getattr(source, 'user_name', None))
+
+
+class ChatWork:
+    """Runs a delegated request in its own thread under the chat the call came from.
+
+    One thread per task means tasks stop queueing in a single conversation, each one is a
+    normal Hermes thread the caller can open and keep typing in, and each gets its own
+    session, tools and permissions because the request is dispatched through the
+    adapter's own inbound path. A call already running in a thread has nothing to nest
+    into, and a channel that refuses thread creation falls back to the call's own chat.
     """
 
-    def __init__(self, adapter, source, chat_id, *, quiet=QUIET_S, settle=None):
+    def __init__(self, adapter, source, chat_id, *, quiet=QUIET_S, name_prefix='live voice: ',
+                 event_factory=None):
         self.adapter = adapter
         self.source = source
         self.chat_id = str(chat_id)
         self.quiet = quiet
-        self.settle = settle
+        self.name_prefix = name_prefix
+        self.event_factory = event_factory or core_message_event
+        self.threads = {}
+        self._chat = self.chat_id
         self._parts = []
 
-    def _capture(self, chat_id, content, *args, **kwargs):
-        if str(chat_id) == self.chat_id and isinstance(content, str) and content.strip():
+    async def _capture(self, chat_id, content, *args, **kwargs):
+        # Drop-in for adapter.send, which callers await.
+        if str(chat_id) == self._chat and isinstance(content, str) and content.strip():
             self._parts.append(content.strip())
 
-    async def __call__(self, text):
-        from gateway.platforms.event import MessageEvent
+    async def _seed(self, chat_id, text):
+        """Show the caller what was asked, so the thread reads on its own."""
+        try:
+            await self.adapter.send(chat_id, '\N{STUDIO MICROPHONE} ' + ' '.join(str(text).split()))
+        except Exception:
+            logger.warning('Live Voice: could not seed task thread %s', chat_id, exc_info=True)
 
-        event = MessageEvent(text=str(text), source=self.source,
-                             user_id=getattr(self.source, 'user_id', None),
-                             user_name=getattr(self.source, 'user_name', None))
+    async def _thread_for(self, text, item_id):
+        if getattr(self.source, 'chat_type', None) == 'thread':
+            return self.chat_id
+        create = getattr(self.adapter, 'create_handoff_thread', None)
+        if not callable(create):
+            return self.chat_id
+        name = (self.name_prefix + ' '.join(str(text).split()))[:80].strip() or self.name_prefix.strip()
+        try:
+            thread_id = await create(self.chat_id, name)
+        except Exception:
+            logger.warning('Live Voice: task thread creation failed; using the call chat', exc_info=True)
+            return self.chat_id
+        if not thread_id:
+            return self.chat_id
+        thread_id = str(thread_id)
+        self.threads[str(item_id)] = thread_id
+        logger.warning('Live Voice: task %s runs in thread %s', item_id, thread_id)
+        await self._seed(thread_id, text)
+        return thread_id
+
+    async def __call__(self, text, item_id=None):
+        from dataclasses import replace
+
+        chat_id = await self._thread_for(text, item_id)
+        source = self.source
+        if chat_id != self.chat_id:
+            source = replace(self.source, chat_id=chat_id, chat_type='thread',
+                             thread_id=chat_id, parent_chat_id=self.chat_id)
+        event = self.event_factory(str(text), source)
         send = self.adapter.send
+        self._chat, self._parts = chat_id, []
         self.adapter.send = self._capture
         try:
             await self.adapter.handle_message(event)

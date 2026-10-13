@@ -88,6 +88,11 @@ class PCMTrack(AudioStreamTrack):
         self.pts = 0
         self.origin = None
         self.lock = asyncio.Lock()
+        # Counters for what a listener actually hears: silence where audio was expected.
+        self.frames_out = 0
+        self.underruns = 0
+        self.late_rebases = 0
+        self.max_queue = 0
 
     async def append(self, pcm):
         if not isinstance(pcm, bytes) or len(pcm) % 2 or len(pcm) > 480000:
@@ -123,17 +128,27 @@ class PCMTrack(AudioStreamTrack):
             # never burst overdue frames or discard buffered participant speech.
             self.origin = loop.time() - self.pts / 24000
             target = loop.time()
+            self.late_rebases += 1
         await asyncio.sleep(max(0, target - loop.time()))
         await self._require_live()
         try:
             pcm = self.frames.get_nowait()
         except asyncio.QueueEmpty:
+            # Nothing buffered: the call hears silence here. This is stuttering.
+            self.underruns += 1
             pcm = b'\x00' * 960
+        self.frames_out += 1
+        self.max_queue = max(self.max_queue, self.frames.qsize())
         frame = av.AudioFrame(format='s16', layout='mono', samples=480)
         frame.planes[0].update(pcm)
         frame.sample_rate, frame.time_base, frame.pts = 24000, Fraction(1, 24000), self.pts
         self.pts += 480
         return frame
+
+    def stats(self):
+        return {'frames': self.frames_out, 'underruns': self.underruns,
+                'late_rebases': self.late_rebases, 'max_queue': self.max_queue,
+                'queued_bytes': len(self.pending)}
 
     def drain(self):
         self.pending = b''
@@ -216,6 +231,24 @@ class MediaLane:
         except Exception:
             self._fail()
 
+    async def _report_audio(self, interval=10.0):
+        """Say out loud what the audio path is doing, every few seconds."""
+        try:
+            while not self._closed:
+                await asyncio.sleep(interval)
+                if self._closed or self._track is None:
+                    continue
+                counters = self._track.stats()
+                logger.warning('Live Voice audio: frames=%d underruns=%d late_rebases=%d max_queue=%d '
+                               'queued_bytes=%d buffered=%s ready=%s',
+                               counters['frames'], counters['underruns'], counters['late_rebases'],
+                               counters['max_queue'], counters['queued_bytes'],
+                               getattr(self.channel, 'bufferedAmount', None), self.ready)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception('Live Voice: audio reporting stopped')
+
     async def start(self, prompt, voice=None):
         if self._started or self._closed:
             raise MediaRefused('fresh lane required')
@@ -259,6 +292,7 @@ class MediaLane:
                         self.ready = True
                         self._gate.set()
                         self._spawn(self._watch_scope())
+                        self._spawn(self._report_audio())
                         return
                     self._changed.clear()
                     await self._changed.wait()
@@ -373,6 +407,7 @@ class MediaLane:
             await queue.stop()
 
     async def close(self):
+        self._closed = True
         await self._stop_delegations()
         if self._closing is None:
             self._closed = True  # fence synchronously before the cleanup await

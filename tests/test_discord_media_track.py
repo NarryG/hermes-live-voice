@@ -42,3 +42,25 @@ def test_appending_bad_pcm_still_refuses():
     track = PCMTrack(_gate(), lambda: None)
     with pytest.raises(MediaRefused):
         asyncio.run(track.append(b'\x01'))
+
+
+def test_silence_where_audio_was_expected_is_counted():
+    """An underrun is what a listener hears as stuttering."""
+    track = PCMTrack(_gate(), lambda: None)
+    assert track.stats()['underruns'] == 0
+    asyncio.run(track.recv())
+    asyncio.run(track.recv())
+    counters = track.stats()
+    assert counters['frames'] == 2
+    assert counters['underruns'] == 2      # nothing was ever queued
+    assert set(counters) == {'frames', 'underruns', 'late_rebases', 'max_queue', 'queued_bytes'}
+
+
+def test_buffered_audio_is_not_an_underrun():
+    track = PCMTrack(_gate(), lambda: None)
+    asyncio.run(track.append(b'\x11' * 960))
+    asyncio.run(track.recv())
+    counters = track.stats()
+    assert counters['frames'] == 1
+    assert counters['underruns'] == 0
+    assert counters['queued_bytes'] == 0

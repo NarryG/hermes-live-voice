@@ -12,7 +12,7 @@ def test_minted_identity_does_not_invent_owner_or_host(profile, allow_chat):
     ns = load_unit(PLUGIN_API, "_mint_for")
     captured = {}
     sections = {"PERSONA": "A helpful test bot."}
-    auth = SimpleNamespace(token="test-token")
+    auth = SimpleNamespace(token="test-token", source="env")
     descriptor = object()
 
     def mint(**kwargs):

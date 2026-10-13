@@ -4,3 +4,9 @@ description: English-first Live Voice for Hermes Desktop and an offline-exercise
   Discord voice preview. Discord uses the existing bot, owning-host selected Codex
   metadata/file login and token-opaque direct WebRTC, with participant consent and no
   task executor. Review, pinned release and live entitlement validation remain gates.
+# Hermes signs the Realtime / usage requests with the user's openai-codex sign-in
+# (hermes_cli.plugin_provider_requests, NousResearch/hermes-agent#136117). The plugin
+# never reads, refreshes or rewrites a Codex token.
+requires_hermes: ">=0.21.7"
+requires_auth:
+  - openai-codex

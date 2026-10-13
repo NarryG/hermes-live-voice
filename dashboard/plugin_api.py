@@ -10,15 +10,17 @@ Routes (mounted at /api/plugins/talk-desktop/):
   GET  /codex/status        → estado de la sesión Codex (sin secretos) + login en curso
   POST /codex/login/start   → inicia `codex login --device-auth` (URL + código para el usuario)
   POST /codex/login/cancel  → cancela un login pendiente
-  POST /codex/logout        → cierra la sesión (respaldo del auth.json; afecta voz + Codex CLI del VPS)
-  GET  /codex/usage         → uso/quota del plan ChatGPT (rate_limit del endpoint wham/usage)
+  POST /codex/logout        → no borra nada: indica `hermes auth logout openai-codex` (la sesión es de Hermes)
+  GET  /codex/usage         → uso/quota del plan ChatGPT (agent.account_usage de Hermes, solo lectura)
   GET  /voice/usage         → uso local acumulado de Live Voice (últimos 7 días)
   POST /voice/usage/report  → {durationMs, audioMs} → acumula la sesión al día (lo llama el renderer al colgar)
   POST /tool                → ejecuta una tool de voz (talk_tools) y devuelve texto para hablar
   POST /codexlive/session   → {profile?, voice?, offer(SDP)} → negocia gpt-live-1-codex (v3) vía codex app-server
   POST /codexlive/stop      → {threadId} → cierra la sesión realtime de Codex Live
 
-El secret efímero va SOLO al renderer del desktop; el OAuth nunca sale del VPS.
+El secret efímero va SOLO al renderer del desktop. Con la suscripción ChatGPT el plugin
+NUNCA toca el token: Hermes firma el request (`credentialed_provider_request`, requiere
+`requires_auth: [openai-codex]` en plugin.yaml) con su propio refresh bajo lock.
 """
 
 from __future__ import annotations
@@ -57,7 +59,28 @@ for _p in (str(_PLUGIN_ROOT), str(_TALK_VENDOR_ROOT), str(_HERMES_TALK_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import talk_auth  # noqa: E402
+def _load_vendored_talk_auth():
+    """Pin `talk_auth` to the bundled copy, even when hermes-talk is installed.
+
+    The vendored module never refreshes or rewrites a Codex token (Hermes signs those
+    requests). Registering it in sys.modules first means any hermes-talk module that does
+    `import talk_auth` in this process gets the same non-refreshing copy, so there is
+    only one refresher: Hermes.
+    """
+    import importlib.util
+
+    cached = sys.modules.get("talk_auth")
+    vendored = _TALK_VENDOR_ROOT / "talk_auth.py"
+    if cached is not None and Path(getattr(cached, "__file__", "") or "").resolve() == vendored.resolve():
+        return cached
+    spec = importlib.util.spec_from_file_location("talk_auth", vendored)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["talk_auth"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+talk_auth = _load_vendored_talk_auth()
 import talk_capabilities  # noqa: E402
 import talk_config  # noqa: E402
 import talk_host  # noqa: E402
@@ -318,15 +341,114 @@ def _mint_for(profile: str | None, voice: str, allow_chat: bool = True, language
             )
         )
     auth = talk_auth.resolve_auth()
-    descriptor = talk_wire.mint_ephemeral_session(
-        auth_token=auth.token,
-        model=talk_config.talk_model(),
-        voice=voice,
-        instructions=instructions,
-        tools=tools,
-        text_output=False,
-    )
+    model = talk_config.talk_model()
+    if auth.source == "codex-oauth":  # talk_auth.SOURCE_CODEX_OAUTH: no token, Hermes signs
+        session = talk_wire.build_session_payload(
+            model=model, voice=voice, instructions=instructions, tools=tools, text_output=False,
+        )
+        secret, expires_at_ms = talk_wire.parse_client_secret(_post_client_secret(session))
+        descriptor = talk_wire.TalkSessionDescriptor(
+            client_secret=secret,
+            expires_at_ms=expires_at_ms,
+            offer_url=talk_wire.OPENAI_REALTIME_OFFER_URL,
+            model=model,
+            voice=voice,
+        )
+    else:
+        # The operator's own API key (TALK_OPENAI_API_KEY / OPENAI_API_KEY).
+        descriptor = talk_wire.mint_ephemeral_session(
+            auth_token=auth.token,
+            model=model,
+            voice=voice,
+            instructions=instructions,
+            tools=tools,
+            text_output=False,
+        )
     return descriptor, auth
+
+
+# ── Hermes-signed provider requests (the plugin never holds the Codex token) ──
+
+_HERMES_LOGOUT_CMD = "hermes auth logout openai-codex"
+
+
+def _provider_requests():
+    """Hermes core's signed-request API; None on a Hermes too old to ship it."""
+    try:
+        from hermes_cli import plugin_provider_requests
+    except ImportError:
+        return None
+    return plugin_provider_requests
+
+
+def _post_client_secret(session: dict) -> dict:
+    """Mint a Realtime client secret with the user's Hermes openai-codex sign-in.
+
+    Hermes resolves the token through its own locked refresh, sends it only to
+    api.openai.com and never follows redirects. This must stay a plugin function
+    called from plugin code: Hermes attributes the request to the plugin it finds
+    on the call stack, and checks `requires_auth: [openai-codex]` in plugin.yaml.
+    """
+    ppr = _provider_requests()
+    if ppr is None:
+        raise talk_wire.TalkUpstreamError(
+            "This Hermes is too old for subscription voice: update Hermes "
+            "(it needs core-signed provider requests), or set TALK_OPENAI_API_KEY."
+        )
+    try:
+        r = ppr.credentialed_provider_request(
+            "openai-codex", "POST", talk_wire.CLIENT_SECRETS_URL,
+            json={"session": session}, timeout=30,
+        )
+    except ppr.ProviderNotSignedIn as exc:
+        raise talk_wire.TalkUpstreamError(str(exc)) from exc
+    if r.status >= 400:
+        raise talk_wire.TalkUpstreamError(
+            f"OpenAI Realtime client secret failed ({r.status}): {r.text[:300]}"
+        )
+    try:
+        payload = r.json()
+    except Exception as exc:  # noqa: BLE001
+        raise talk_wire.TalkUpstreamError("OpenAI Realtime client secret returned non-JSON") from exc
+    if not isinstance(payload, dict):
+        raise talk_wire.TalkUpstreamError("OpenAI Realtime client secret returned invalid payload")
+    return payload
+
+
+# Hermes labels the Codex windows "Session" (5h) and "Weekly"; the panel keeps its own labels.
+_CODEX_WINDOWS = {"session": ("5h", 300), "weekly": ("semanal", 7 * 1440)}
+
+
+def _window_minutes(label: str) -> tuple[str, int | None]:
+    return _CODEX_WINDOWS.get((label or "").strip().lower(), (str(label), None))
+
+
+def _codex_usage_snapshot() -> dict:
+    """Plan usage from Hermes's own read-only fetcher, in the panel's shape."""
+    try:
+        from agent.account_usage import fetch_account_usage
+    except ImportError:
+        return {"ok": False, "error": "update Hermes to read Codex usage"}
+    try:
+        snap = fetch_account_usage("openai-codex", read_only=True)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:160]}
+    if snap is None:
+        return {"ok": False, "error": "usage unavailable (sign in to openai-codex in Hermes)"}
+    if getattr(snap, "unavailable_reason", None):
+        return {"ok": False, "error": str(snap.unavailable_reason)[:160]}
+    windows: dict = {}
+    for w in getattr(snap, "windows", ()) or ():
+        if getattr(w, "scope", "account") != "account":
+            continue
+        reset = getattr(w, "reset_at", None)
+        label, minutes = _window_minutes(str(w.label))
+        windows[label] = {
+            "usedPercent": None if w.used_percent is None else round(float(w.used_percent)),
+            "windowMinutes": minutes,
+            "resetsAt": int(reset.timestamp()) if reset is not None else None,
+        }
+    return {"ok": True, "plan": getattr(snap, "plan", None) or None, "windows": windows}
 
 
 # ── Codex OAuth: sesión de voz (device-code login / logout / status) ─────────
@@ -545,75 +667,7 @@ if router is not None:
 
     @router.get("/codex/usage")
     async def codex_usage() -> dict:
-        def _do() -> dict:
-            try:
-                auth = talk_auth.resolve_auth()
-            except Exception as exc:  # noqa: BLE001
-                return {"ok": False, "error": str(exc)[:160]}
-            try:
-                import httpx
-                account_id = ""
-                try:
-                    data = json.loads(_codex_auth_path().read_text(encoding="utf-8"))
-                    account_id = str((data.get("tokens") or {}).get("account_id") or "")
-                except Exception:  # noqa: BLE001
-                    pass
-                headers = {
-                    "Authorization": f"Bearer {auth.token}",
-                    "Accept": "application/json",
-                    "User-Agent": "codex-cli",
-                }
-                if account_id:
-                    headers["ChatGPT-Account-Id"] = account_id
-                payload = None
-                last_status = None
-                for url in (
-                    "https://chatgpt.com/backend-api/wham/usage",
-                    "https://api.openai.com/api/codex/usage",
-                ):
-                    with httpx.Client(timeout=12.0) as client:
-                        resp = client.get(url, headers=headers)
-                    last_status = resp.status_code
-                    if resp.status_code == 200:
-                        payload = resp.json() or {}
-                        break
-                if payload is None:
-                    return {"ok": False, "error": f"usage http {last_status}"}
-                rl = payload.get("rate_limit") or {}
-                windows: dict = {}
-                for key, fallback in (("primary_window", "primary"), ("secondary_window", "secondary")):
-                    w = rl.get(key) or {}
-                    if not (isinstance(w, dict) and w):
-                        continue
-                    mins = w.get("window_minutes")
-                    secs = w.get("limit_window_seconds")
-                    if not mins and secs:
-                        try:
-                            mins = int(secs) // 60
-                        except Exception:  # noqa: BLE001
-                            mins = None
-                    if mins:
-                        mins = int(mins)
-                        if mins == 7 * 1440:
-                            label = "weekly"
-                        else:
-                            label = f"{mins // 60}h" if mins % 60 == 0 else f"{mins}m"
-                    else:
-                        label = fallback
-                    windows[label] = {
-                        "usedPercent": w.get("used_percent"),
-                        "windowMinutes": mins,
-                        "resetsAt": w.get("reset_at") or w.get("resets_at"),
-                    }
-                return {
-                    "ok": True,
-                    "plan": payload.get("plan_type") or payload.get("plan") or None,
-                    "windows": windows,
-                }
-            except Exception as exc:  # noqa: BLE001
-                return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:160]}
-
-        return await asyncio.to_thread(_do)
+        return await asyncio.to_thread(_codex_usage_snapshot)
 
     # ── uso de Live Voice (metrado local por sesión) ──────────────────────────
     _VU_FILE = _PLUGIN_ROOT / "data" / "voice-usage.json"
@@ -748,20 +802,14 @@ if router is not None:
 
     @router.post("/codex/logout")
     async def codex_logout() -> dict:
-        def _do() -> dict:
-            path = _codex_auth_path()
-            if not path.exists():
-                return {"ok": True, "message": "There was no session to sign out of"}
-            ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-            bak = path.with_name(f"auth.json.bak-voice-logout-{ts}")
-            try:
-                shutil.copy2(path, bak)
-                path.unlink()
-            except OSError as exc:
-                return {"ok": False, "message": f"Could not sign out: {exc}"}
-            return {"ok": True, "message": f"Signed out (backup: {bak.name})"}
-
-        return await asyncio.to_thread(_do)
+        # The sign-in belongs to Hermes (and the Codex CLI), not to this plugin: deleting
+        # ~/.codex/auth.json here used to sign the Codex CLI out too. Point at Hermes instead.
+        return {
+            "ok": False,
+            "managedBy": "hermes",
+            "command": _HERMES_LOGOUT_CMD,
+            "message": f"Sign out with `{_HERMES_LOGOUT_CMD}` or Hermes Desktop > Providers.",
+        }
 
 
 # ── Codex Live-1 (gpt-live-1-codex, v3/frameless) vía codex app-server ───────

@@ -73,14 +73,10 @@ command -v ffmpeg >/dev/null 2>&1 && echo "  ffmpeg         : present" || echo "
 
 echo "== live Discord command (read-only) =="
 "$PY_BIN" -c "
-import json, urllib.request, datetime
-from pathlib import Path
-token = None
-for line in Path('/opt/data/.env').read_text().splitlines():
-    if 'DISCORD' in line and 'TOKEN' in line and '=' in line:
-        token = line.split('=', 1)[1].strip().strip('\"').strip(\"'\")
+import json, urllib.request, datetime, os
+token = os.environ.get('DISCORD_BOT_TOKEN')
 if not token:
-    print('  (no discord token found)'); raise SystemExit
+    print('  (skipped: export DISCORD_BOT_TOKEN to include this check; the doctor never reads .env)'); raise SystemExit
 UA = 'DiscordBot (https://github.com/NousResearch/hermes-agent, 1.0)'
 def get(u):
     r = urllib.request.Request(u, headers={'Authorization': 'Bot ' + token, 'User-Agent': UA})

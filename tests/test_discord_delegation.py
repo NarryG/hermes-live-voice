@@ -93,7 +93,9 @@ def test_a_task_that_outruns_the_call_reports_and_frees_the_queue():
     assert reported == [TIMEOUT_TEXT]
 
 
-def test_a_full_queue_is_refused_not_silently_dropped():
+def test_work_beyond_the_backlog_is_refused_not_silently_dropped():
+    """A voice process runs few turns at once; the rest wait, and only a full backlog refuses."""
+
     async def run(text, item_id=None):
         await asyncio.sleep(30)
 
@@ -101,10 +103,10 @@ def test_a_full_queue_is_refused_not_silently_dropped():
         pass
 
     async def main():
-        board = TaskBoard(run, report, capacity=2).start()
-        assert board.submit('a', 'x') is True
-        assert board.submit('b', 'x') is True
-        assert board.submit('c', 'x') is False   # at capacity: refused, never dropped quietly
+        board = TaskBoard(run, report, capacity=1, backlog=1).start()
+        assert board.submit('a', 'x') is True     # dispatched
+        assert board.submit('b', 'x') is True     # queued behind it
+        assert board.submit('c', 'x') is False    # backlog full: refused, never dropped quietly
         await board.stop()
 
     _run(main())
@@ -369,22 +371,27 @@ def test_each_task_is_reported_when_it_finishes():
     assert dict(reported)['slow'] == 'answer for slow'
 
 
-def test_capacity_counts_tasks_in_flight():
+def test_capacity_limits_turns_at_once_and_releases_the_queue():
+    """Only `capacity` turns run at a time; the next one starts when one finishes."""
+
     async def run(text, item_id=None):
-        await asyncio.sleep(.2)
+        await asyncio.sleep(.15)
         return 'x'
 
     async def report(item_id, text):
         pass
 
     async def main():
-        board = TaskBoard(run, report, capacity=2).start()
+        board = TaskBoard(run, report, capacity=1, backlog=3).start()
         assert board.submit('a', 'x') is True
-        assert board.submit('b', 'x') is True
-        assert board.submit('c', 'x') is False      # at capacity
-        while board.inflight:
-            await asyncio.sleep(.02)
-        assert board.submit('d', 'x') is True       # room again
+        assert board.submit('b', 'x') is True       # waits, does not refuse
+        assert len(board.inflight) == 1
+        for _ in range(200):
+            if not board.inflight and not board._waiting:
+                break
+            await asyncio.sleep(.01)
+        assert board.inflight == {}
+        assert board._waiting == []
         await board.stop()
 
     _run(main())

@@ -61,6 +61,8 @@ class Session:
         self.rx_droughts = 0
         self.rx_overflows = 0
         self.rx_report = time.monotonic()
+        self.pump_last = None
+        self.pump_max_tick = 0.0
         self.out_min = 10 ** 9
         self.out_empty = 0
 
@@ -284,6 +286,14 @@ class Session:
                     accepted = source.feed(pending_output)
                     pending_output = pending_output[accepted:]
                 now = time.monotonic()
+                # How long this 10ms pump was itself held off the CPU. The voice process
+                # shares its event loop with agent turns, and a starved pump is what the
+                # caller hears as gaps -- so measure it rather than infer it.
+                if self.pump_last is not None:
+                    tick = now - self.pump_last
+                    if tick > self.pump_max_tick:
+                        self.pump_max_tick = tick
+                self.pump_last = now
                 if now - self.rx_report >= 10.0:
                     self.rx_report = now
                     logger.warning('Live Voice rx leg: packets=%d maxgap=%.3f droughts=%d '
@@ -293,6 +303,9 @@ class Session:
                                    self.rx_overflows, self.incoming.qsize(),
                                    0 if append_task is not None else 1,
                                    self.out_min, self.out_empty, lane.audio.qsize())
+                    logger.warning('Live Voice pump: max_tick=%.3fs (10ms cadence expected)',
+                                   self.pump_max_tick)
+                    self.pump_max_tick = 0.0
                     self.out_min = source.limit
                 await asyncio.sleep(.01)
         except asyncio.CancelledError:

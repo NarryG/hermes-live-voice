@@ -13,7 +13,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-CAPACITY = 4
+CONCURRENCY = 2   # turns at once: the voice process shares its loop with them
+BACKLOG = 4       # further requests wait here instead of being refused
 TIMEOUT_S = 240.0
 SPEAKABLE_CHARS = 1200
 QUIET_S = 1.5
@@ -49,12 +50,14 @@ class TaskBoard:
     a request is refused rather than silently dropped.
     """
 
-    def __init__(self, run, report, *, capacity=CAPACITY, timeout=TIMEOUT_S):
+    def __init__(self, run, report, *, capacity=CONCURRENCY, backlog=BACKLOG, timeout=TIMEOUT_S):
         self._run = run
         self._report = report
         self._capacity = max(1, int(capacity))
+        self._backlog = max(0, int(backlog))
         self._timeout = timeout
         self._inflight = {}
+        self._waiting = []
         self._closed = False
 
     @property
@@ -69,18 +72,41 @@ class TaskBoard:
         return self
 
     def submit(self, item_id, text):
-        """Dispatch one request; False when at capacity or the call is closing."""
-        if self._closed or len(self._inflight) >= self._capacity:
+        """Queue one request. A busy voice process runs few turns at once on purpose.
+
+        Agent turns hold the process's event loop; several at once starved the audio path
+        badly enough to produce ten-second gaps in both directions. Extra work waits in a
+        bounded backlog instead of being refused while there is room for it.
+        """
+        if self._closed:
             return False
         item_id = str(item_id)
-        task = asyncio.create_task(self._serve(item_id, str(text or '').strip()))
-        self._inflight[item_id] = task
-        task.add_done_callback(lambda _t, i=item_id: self._inflight.pop(i, None))
-        logger.warning('Live Voice: task dispatched item=%s inflight=%d', item_id, len(self._inflight))
+        if len(self._inflight) >= self._capacity:
+            if len(self._waiting) >= self._backlog:
+                return False
+            self._waiting.append((item_id, str(text or '').strip()))
+            logger.warning('Live Voice: task queued item=%s waiting=%d inflight=%d',
+                           item_id, len(self._waiting), len(self._inflight))
+            return True
+        self._dispatch(item_id, str(text or '').strip())
         return True
+
+    def _dispatch(self, item_id, text):
+        task = asyncio.create_task(self._serve(item_id, text))
+        self._inflight[item_id] = task
+        task.add_done_callback(lambda _t, i=item_id: self._pump(i))
+        logger.warning('Live Voice: task dispatched item=%s inflight=%d waiting=%d',
+                       item_id, len(self._inflight), len(self._waiting))
+
+    def _pump(self, finished):
+        self._inflight.pop(finished, None)
+        while self._waiting and len(self._inflight) < self._capacity and not self._closed:
+            item_id, text = self._waiting.pop(0)
+            self._dispatch(item_id, text)
 
     async def stop(self):
         self._closed = True
+        self._waiting.clear()
         tasks = list(self._inflight.values())
         self._inflight.clear()
         for task in tasks:

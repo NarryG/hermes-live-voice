@@ -28,7 +28,8 @@ say() { printf '%s\n' "$*"; }
 bad() { printf '  [FAIL] %s\n' "$*"; FAILED=1; }
 
 [ -n "$SHA" ] || { echo "usage: lane-update.sh <40-hex-sha> [repo-url]"; exit 2; }
-case "$SHA" in *[!0-9a-f]*|????????????????????????????????????????) echo "not a 40-hex sha: $SHA"; exit 2 ;; esac
+case "$SHA" in *[!0-9a-f]*) echo "not a lowercase 40-hex sha: $SHA"; exit 2 ;; esac
+[ "${#SHA}" -eq 40 ] || { echo "not a 40-hex sha (${#SHA} chars): $SHA"; exit 2; }
 
 say "1. stage $SHA through the installer (isolated home, no enable, no deps)"
 rm -rf "$STAGE_HOME"

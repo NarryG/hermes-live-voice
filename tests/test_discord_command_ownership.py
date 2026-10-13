@@ -105,6 +105,91 @@ def test_teardown_deletes_the_command_it_registered(tmp_path):
     asyncio.run(scenario())
 
 
+def discord_http_over(native, remote, calls, policy='safe'):
+    """Same routes bound to an existing remote store, for a second process."""
+    adapter, _, _ = discord_http(native, policy)
+    def as_read(data):
+        out = dict(data)
+        for key, default in APPLIED_DEFAULTS.items():
+            if out.get(key) is None:
+                out[key] = default
+        return out
+
+    async def fetch(app_id):
+        calls.append(('fetch', app_id))
+        return [as_read(value) for value in remote.values()]
+
+    async def upsert(app_id, payload):
+        raise AssertionError('a restart must not re-create a command that already exists')
+
+    async def delete(app_id, command_id):
+        raise AssertionError('a restart must not delete the command it still owns')
+
+    native.http.get_global_commands = fetch
+    native.http.upsert_global_command = upsert
+    native.http.delete_global_command = delete
+    return adapter, remote, calls
+
+
+def test_restart_adopts_the_command_it_registered_before(tmp_path):
+    """A gateway restart must re-own its command instead of refusing it.
+
+    Production symptom: the lane registered the command in one process, and the
+    next process found it, called it a foreign collision, tore its own handler
+    down and left the command orphaned - so every invocation answered
+    "The application did not respond".
+    """
+    m = importlib.import_module('discord_voice.native')
+
+    async def scenario():
+        native = commands.Bot(command_prefix='!', intents=discord.Intents.none())
+        adapter, remote, calls = discord_http(native)
+        first = m.install(native, adapter, tmp_path, object)
+        assert await asyncio.wait_for(first.ready, 5) is True
+        stored = remote[991]
+        for key, default in APPLIED_DEFAULTS.items():
+            if stored.get(key) is None:
+                stored[key] = default  # Discord now reports applied defaults
+        native.tree.remove_command('livevoice')
+        first.closed = True  # the process is gone: no teardown ran
+        await native.close()
+
+        second_native = commands.Bot(command_prefix='!', intents=discord.Intents.none())
+        second_adapter, _, _ = discord_http_over(second_native, remote, calls)
+        second = m.install(second_native, second_adapter, tmp_path, object)
+        try:
+            assert await asyncio.wait_for(second.ready, 5) is True
+            assert second.synced and not second.closed
+            assert second_native.tree.get_command('livevoice') is second.command
+            assert second.remote is not None
+        finally:
+            await second.close()
+            await second_native.close()
+
+    asyncio.run(scenario())
+
+
+def test_foreign_command_is_still_refused(tmp_path):
+    """Adoption must not weaken the guard: someone else's command is untouched."""
+    m = importlib.import_module('discord_voice.native')
+
+    async def scenario():
+        native = commands.Bot(command_prefix='!', intents=discord.Intents.none())
+        adapter, remote, calls = discord_http(native)
+        remote[991] = {'name': 'livevoice', 'type': 1, 'description': 'Somebody else built this',
+                       'id': '991', 'application_id': '456', 'version': '1'}
+        handle = m.install(native, adapter, tmp_path, object)
+        try:
+            assert await asyncio.wait_for(handle.ready, 5) is False
+            assert not [c for c in calls if c[0] in ('upsert', 'delete')]
+            assert remote[991]['description'] == 'Somebody else built this'
+        finally:
+            await handle.close()
+            await native.close()
+
+    asyncio.run(scenario())
+
+
 def test_teardown_refuses_a_command_someone_else_changed(tmp_path):
     m = importlib.import_module('discord_voice.native')
 

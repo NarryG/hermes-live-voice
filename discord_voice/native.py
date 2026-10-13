@@ -281,14 +281,28 @@ class NativeHandle:
                 raise RuntimeError('Unsupported command policy or native identity.')
             http = self.native.http
             app_id = self.native.application_id or self.native.user.id
+            payload = self.command.to_dict(self.native.tree)
             existing = await http.get_global_commands(app_id)
-            if any(c.get('name') == self.command.name and int(c.get('type', 1)) == 1 for c in existing):
-                raise RuntimeError('Remote command collision; ownership unavailable.')
+            # Re-check ownership across the fetch: a rebuilt native client or a
+            # changed policy during the read must reach neither adoption nor a write.
             if (self.closed or self.adapter._client is not self.native
                     or self.adapter._get_discord_command_sync_policy() not in ('safe', 'bulk')
                     or self.native.tree.get_command('livevoice') is not self.command):
                 raise RuntimeError('Command ownership or policy changed.')
-            payload = self.command.to_dict(self.native.tree)
+            named = [c for c in existing
+                     if c.get('name') == self.command.name and int(c.get('type', 1)) == 1]
+            if named:
+                # A restart registers nothing: re-own the command this plugin
+                # registered in an earlier process while it still carries our
+                # fields. Anything else is someone else's command - never adopt
+                # it, never overwrite it, never delete it.
+                adopted = next((c for c in named if registration_matches(payload, c)), None)
+                if adopted is None:
+                    raise RuntimeError('Remote command collision; ownership unavailable.')
+                self.remote = (app_id, dict(adopted))
+                self.synced = not self.closed
+                self.sync_status = 'verified'
+                return True
             self.mutating = True
             created = await asyncio.wait_for(http.upsert_global_command(app_id, payload), 30)
             self.remote = (app_id, dict(created))

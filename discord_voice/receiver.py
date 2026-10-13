@@ -88,7 +88,7 @@ def new_receiver(base, voice_client, owner, guard, deliver):
                     self._buffers.clear()
                     if self._drops < 10:
                         self._drops += 1
-                        logger.info('Live Voice rx: dropping ssrc=%s (running=%s guard=%s mapped=%s rejected=%s)',
+                        logger.warning('Live Voice rx: dropping ssrc=%s (running=%s guard=%s mapped=%s rejected=%s)',
                                     ssrc, self._running, bool(guard()),
                                     self._ssrc_to_user.get(ssrc), ssrc in self._rejected)
                     return
@@ -101,7 +101,7 @@ def new_receiver(base, voice_client, owner, guard, deliver):
                 if pcm and len(pcm) <= 23040 and guard():
                     if self._delivered < 10:
                         self._delivered += 1
-                        logger.info('Live Voice rx: delivering %d bytes from user=%s', len(pcm), self._ssrc_to_user[ssrc])
+                        logger.warning('Live Voice rx: delivering %d bytes from user=%s', len(pcm), self._ssrc_to_user[ssrc])
                     deliver(SpeakerPCM(self._ssrc_to_user[ssrc], time.monotonic(),
                                        struct.unpack_from('>I', packet, 4)[0], pcm))
 

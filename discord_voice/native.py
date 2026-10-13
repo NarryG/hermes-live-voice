@@ -208,8 +208,11 @@ class NativeHandle:
                 message = 'Voice operation failed; status is unknown. No upstream details are disclosed.'
             # The reply is the only user-visible outcome; without it a silent lane
             # and a refusing lane look identical in the logs.
-            logger.info('Live Voice: /livevoice %s by user=%s -> %s', operation,
-                        getattr(getattr(interaction, 'user', None), 'id', '?'), message)
+            # WARNING, not INFO: the plugin's logger only reaches the log files at
+            # WARNING in this deployment, and this line is the only record of the
+            # user-visible outcome.
+            logger.warning('Live Voice: /livevoice %s by user=%s -> %s', operation,
+                           getattr(getattr(interaction, 'user', None), 'id', '?'), message)
             if self.closed or self.manager.closed.is_set():
                 return
             await interaction.followup.send(message, ephemeral=True)

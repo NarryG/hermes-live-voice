@@ -465,6 +465,16 @@ def test_two_tasks_at_once_do_not_nest_their_observers():
     import asyncio as _aio
 
     class Slow(_CoreAdapter):
+        """Each task gets its own thread, as the real adapter does."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.next_thread = iter(['999', '998'])
+
+        async def create_handoff_thread(self, parent_chat_id, name):
+            self.thread_requests.append((parent_chat_id, name))
+            return next(self.next_thread)
+
         async def handle_message(self, event):
             chat = str(event.source.chat_id)
             self.dispatched.append(chat)
@@ -480,9 +490,10 @@ def test_two_tasks_at_once_do_not_nest_their_observers():
         return await _aio.gather(first('one', 'a'), second('two', 'b'))
 
     answers = _run(main())
-    assert answers == ['answer for 999', 'answer for 999']
+    assert sorted(answers) == ['answer for 998', 'answer for 999']   # each its own thread
 
-    installed = adapter.send
-    assert installed is router_for(adapter).send      # one observer, shared
+    # A bound method is rebuilt on every attribute access, so compare the router itself.
+    installed = adapter.send.__self__
+    assert installed is router_for(adapter)            # one observer, shared
     _run(first('three', 'c'))                          # time passes, more work runs
-    assert adapter.send is installed                   # never re-wrapped or clobbered
+    assert adapter.send.__self__ is installed          # never re-wrapped or clobbered

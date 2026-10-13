@@ -12,10 +12,25 @@ def _gate():
     return gate
 
 
-def test_a_live_track_hands_aiortc_a_frame():
+def _pcm(frames=1, value=b'\x11'):
+    return value * 960 * frames
+
+
+def test_a_filled_cushion_sends_audio_immediately():
     track = PCMTrack(_gate(), lambda: None)
+    asyncio.run(track.append(_pcm(PCMTrack.CUSHION_FRAMES)))
     frame = asyncio.run(track.recv())
     assert frame.samples == 480
+    assert bytes(frame.planes[0])[:2] == b'\x11\x11'
+
+
+def test_the_cushion_holds_audio_until_it_is_filled():
+    """Running exactly in real time, one late frame is audible silence; buffer first."""
+    track = PCMTrack(_gate(), lambda: None)
+    asyncio.run(track.append(_pcm(1)))
+    frame = asyncio.run(track.recv())
+    assert bytes(frame.planes[0])[:2] == b'\x00\x00'   # silence, not the only frame
+    assert track.frames.qsize() == 1                     # the audio is still held
 
 
 def test_a_closed_lane_ends_the_sender_cleanly():
@@ -45,31 +60,27 @@ def test_appending_bad_pcm_still_refuses():
 
 
 def test_a_quiet_call_is_not_counted_as_a_dropout():
-    """Silence with no audio flowing is normal; a dropout is silence mid-sentence."""
     track = PCMTrack(_gate(), lambda: None)
     asyncio.run(track.recv())
     counters = track.stats()
-    assert counters['frames'] == 1
     assert counters['underruns'] == 1      # nothing buffered
     assert counters['dropouts'] == 0       # but no audio had been flowing
-    assert set(counters) == {'frames', 'underruns', 'dropouts', 'late_rebases',
-                             'max_queue', 'queued_bytes'}
+    assert set(counters) == {'frames', 'underruns', 'dropouts', 'late_rebases', 'max_queue',
+                             'queued_bytes', 'in_bytes', 'in_maxgap', 'in_droughts'}
 
 
 def test_silence_right_after_audio_is_counted_as_a_dropout():
     track = PCMTrack(_gate(), lambda: None)
-    asyncio.run(track.append(b'\x11' * 960))
-    asyncio.run(track.recv())              # consumes the audio
-    asyncio.run(track.recv())              # immediately after: nothing left
-    counters = track.stats()
-    assert counters['dropouts'] == 1
+    asyncio.run(track.append(_pcm(PCMTrack.CUSHION_FRAMES)))
+    asyncio.run(track.recv())              # sends the first frame
+    for _ in range(PCMTrack.CUSHION_FRAMES + 3):
+        asyncio.run(track.recv())          # drains, then silence while audio was flowing
+    assert track.stats()['dropouts'] >= 1
 
 
-def test_buffered_audio_is_not_an_underrun():
+def test_the_feed_is_measured_on_the_track():
     track = PCMTrack(_gate(), lambda: None)
-    asyncio.run(track.append(b'\x11' * 960))
-    asyncio.run(track.recv())
+    asyncio.run(track.append(_pcm(2)))
     counters = track.stats()
-    assert counters['frames'] == 1
-    assert counters['underruns'] == 0
-    assert counters['queued_bytes'] == 0
+    assert counters['in_bytes'] == 960 * 2
+    assert counters['in_droughts'] == 0

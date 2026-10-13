@@ -80,9 +80,14 @@ def delegation_refusal(event):
 
 class PCMTrack(AudioStreamTrack):
     """Bounded native mixed PCM input, paced by the local RTP sample clock."""
+    CUSHION_FRAMES = 3      # 60ms of slack before sending; bounds added latency
+
     def __init__(self, gate, scope):
         super().__init__()
         self.gate, self.scope = gate, scope
+        self.cushion = self.CUSHION_FRAMES
+        self.primed = False
+        self.empty_frames = 0
         self.frames = asyncio.Queue(maxsize=50)
         self.pending = b''
         self.pts = 0
@@ -92,6 +97,10 @@ class PCMTrack(AudioStreamTrack):
         self.frames_out = 0
         self.underruns = 0
         self.dropouts = 0
+        self.in_bytes = 0
+        self.in_last = None
+        self.in_maxgap = 0.0
+        self.in_droughts = 0
         self.late_rebases = 0
         self.max_queue = 0
         self.last_audio = None
@@ -99,19 +108,17 @@ class PCMTrack(AudioStreamTrack):
     async def append(self, pcm):
         if not isinstance(pcm, bytes) or len(pcm) % 2 or len(pcm) > 480000:
             raise MediaRefused('invalid PCM24 mono input')
-        # The track can only send what it is handed: measure the feed itself, so a starved
-        # ingress is distinguishable from a starved sender. Counters are optional here --
-        # observation must never be able to break the audio path.
+        # Counted on the TRACK, because that is where audio lands; the lane reports these.
+        # Observation must never be able to break the audio path.
         try:
             now = asyncio.get_running_loop().time()
-            last = getattr(self, 'ingress_last', None)
-            if last is not None:
-                gap = now - last
-                self.ingress_gap = max(getattr(self, 'ingress_gap', 0.0), gap)
+            if self.in_last is not None:
+                gap = now - self.in_last
+                self.in_maxgap = max(self.in_maxgap, gap)
                 if gap > .08:
-                    self.ingress_droughts = getattr(self, 'ingress_droughts', 0) + 1
-            self.ingress_last = now
-            self.ingress_bytes = getattr(self, 'ingress_bytes', 0) + len(pcm)
+                    self.in_droughts += 1
+            self.in_last = now
+            self.in_bytes += len(pcm)
         except Exception:
             pass
         async with self.lock:
@@ -149,6 +156,23 @@ class PCMTrack(AudioStreamTrack):
             self.late_rebases += 1
         await asyncio.sleep(max(0, target - loop.time()))
         await self._require_live()
+        # Hold a small cushion. The feed arrives in real time with no slack (measured peak
+        # queue depth of one frame), so anything that delays a frame becomes audible
+        # silence. Fill a few frames before sending, and refill only after a real gap.
+        if self.primed:
+            if self.frames.qsize() == 0:
+                self.empty_frames += 1
+                if self.empty_frames >= 2:
+                    self.primed = False
+                    self.empty_frames = 0
+            else:
+                self.empty_frames = 0
+        else:
+            if self.frames.qsize() < self.cushion:
+                self.underruns += 1
+                pcm = b'\x00' * 960
+                return self._frame(pcm)
+            self.primed = True
         try:
             pcm = self.frames.get_nowait()
         except asyncio.QueueEmpty:
@@ -161,6 +185,9 @@ class PCMTrack(AudioStreamTrack):
             pcm = b'\x00' * 960
         self.frames_out += 1
         self.max_queue = max(self.max_queue, self.frames.qsize())
+        return self._frame(pcm)
+
+    def _frame(self, pcm):
         frame = av.AudioFrame(format='s16', layout='mono', samples=480)
         frame.planes[0].update(pcm)
         frame.sample_rate, frame.time_base, frame.pts = 24000, Fraction(1, 24000), self.pts
@@ -170,7 +197,9 @@ class PCMTrack(AudioStreamTrack):
     def stats(self):
         return {'frames': self.frames_out, 'underruns': self.underruns,
                 'dropouts': self.dropouts, 'late_rebases': self.late_rebases,
-                'max_queue': self.max_queue, 'queued_bytes': len(self.pending)}
+                'max_queue': self.max_queue, 'queued_bytes': len(self.pending),
+                'in_bytes': self.in_bytes, 'in_maxgap': self.in_maxgap,
+                'in_droughts': self.in_droughts}
 
     def drain(self):
         self.pending = b''
@@ -201,10 +230,6 @@ class MediaLane:
         self._session_id = None
         self._delegations = None
         self._append_lock = None
-        self.ingress_bytes = 0
-        self.ingress_last = None
-        self.ingress_gap = 0.0
-        self.ingress_droughts = 0
         self._started = False
         self._remote_audio = False
         self._closed = False
@@ -272,8 +297,7 @@ class MediaLane:
                                counters['late_rebases'], counters['max_queue'],
                                counters['queued_bytes'],
                                getattr(self.channel, 'bufferedAmount', None), self.ready,
-                               getattr(self, 'ingress_bytes', 0), getattr(self, 'ingress_gap', 0.0),
-                               getattr(self, 'ingress_droughts', 0))
+                               counters['in_bytes'], counters['in_maxgap'], counters['in_droughts'])
         except asyncio.CancelledError:
             raise
         except Exception:

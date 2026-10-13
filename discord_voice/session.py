@@ -55,6 +55,12 @@ class Session:
         self.audience = frozenset(m.id for m in channel.members if m.id != manager.native.user.id)
         self.suspending = False
         self.reserved = True
+        self.rx_packets = 0
+        self.rx_last = None
+        self.rx_maxgap = 0.0
+        self.rx_droughts = 0
+        self.rx_overflows = 0
+        self.rx_report = time.monotonic()
 
     def interaction(self, uid=None):
         b = self.binding
@@ -211,10 +217,23 @@ class Session:
         self.state = 'active'
         self.source = PCMSource(lambda: self.guard(epoch))
         def deliver(packet):
+            # The receive leg already has slack (a 256-packet inbound queue and a timed
+            # mixer window), unlike the send path which had none -- so measure it rather
+            # than assume: arrival gaps here are what the provider would hear as broken.
+            now = time.monotonic()
+            if self.rx_last is not None:
+                gap = now - self.rx_last
+                if gap > self.rx_maxgap:
+                    self.rx_maxgap = gap
+                if gap > .08:
+                    self.rx_droughts += 1
+            self.rx_last = now
+            self.rx_packets += 1
             if packet.speaker in self.audience and self.guard(epoch):
                 try:
                     self.incoming.put_nowait((epoch, packet))
                 except queue.Full:
+                    self.rx_overflows += 1
                     self.revoke()
         self.receiver = new_receiver(self.manager.receiver_class, self.vc, self.audience,
                                      lambda: self.guard(epoch), deliver)
@@ -254,6 +273,14 @@ class Session:
                 if pending_output and self.guard(epoch):
                     accepted = source.feed(pending_output)
                     pending_output = pending_output[accepted:]
+                now = time.monotonic()
+                if now - self.rx_report >= 10.0:
+                    self.rx_report = now
+                    logger.warning('Live Voice rx leg: packets=%d maxgap=%.3f droughts=%d '
+                                   'overflows=%d inbound=%d mixer_ready=%d',
+                                   self.rx_packets, self.rx_maxgap, self.rx_droughts,
+                                   self.rx_overflows, self.incoming.qsize(),
+                                   0 if append_task is not None else 1)
                 await asyncio.sleep(.01)
         except asyncio.CancelledError:
             raise

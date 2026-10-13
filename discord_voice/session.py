@@ -472,6 +472,23 @@ class SessionManager:
             _OVERALL_CAPACITY.release()
         return result
 
+    def refresh_prompt(self, session):
+        """Give the call the text threads it may be asked about.
+
+        Task threads are opened in the parent channel, so the caller routinely asks about
+        a thread the call has never been in; without this it answers that it cannot see it.
+        """
+        try:
+            from .threads import directory
+            listing = directory(getattr(session, 'guild', None))
+        except Exception:
+            logger.warning('Live Voice: could not build the thread directory', exc_info=True)
+            return
+        base = getattr(self, 'base_prompt', None) or self.prompt
+        self.base_prompt = base
+        self.prompt = base if not listing else (
+            base + '\n\nText threads in this server you can mention by name:\n' + listing)
+
     async def command(self, interaction, operation):
         if self.closed.is_set():
             return 'Voice manager closed; gateway restart required.'
@@ -582,6 +599,7 @@ class SessionManager:
             try:
                 session = Session(self, interaction, channel, profile)
                 self.sessions[guild_id] = session
+                self.refresh_prompt(session)
                 if not session.environment():
                     await self.finish(session)
                     return 'Voice requires admitted human participants, no extra bots, and Connect/Speak permissions.'

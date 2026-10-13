@@ -15,6 +15,7 @@ from .broker import V3_VOICES
 
 logger = logging.getLogger(__name__)
 
+
 # Any single voice action must answer within this, or the caller is told it stalled.
 COMMAND_TIMEOUT = 75.0
 

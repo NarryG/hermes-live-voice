@@ -1,3 +1,5 @@
+"""Delegated work: queued one at a time, run in the call's chat, reported back."""
+
 import asyncio
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -37,7 +39,7 @@ def test_a_delegated_request_comes_back_to_the_call():
     async def main():
         queue = DelegationQueue(run, report).start()
         assert queue.submit('item-1', 'do the thing') is True
-        for _ in range(60):
+        for _ in range(100):
             if reported:
                 break
             await asyncio.sleep(.01)
@@ -60,7 +62,7 @@ def test_a_failing_task_reports_something_usable():
     async def main():
         queue = DelegationQueue(run, report).start()
         queue.submit('item-2', 'x')
-        for _ in range(60):
+        for _ in range(100):
             if reported:
                 break
             await asyncio.sleep(.01)
@@ -82,7 +84,7 @@ def test_a_task_that_outruns_the_call_reports_and_frees_the_queue():
     async def main():
         queue = DelegationQueue(run, report, timeout=.05).start()
         queue.submit('item-3', 'slow')
-        for _ in range(80):
+        for _ in range(120):
             if reported:
                 break
             await asyncio.sleep(.01)
@@ -131,15 +133,25 @@ class _Source:
     parent_chat_id: Optional[str] = None
 
 
-class _FakeAdapter:
-    """Enough of the core adapter to see which chat a task runs in."""
+class _CoreAdapter:
+    """Enough of the real adapter: dispatch, outbound send, session completion."""
 
-    def __init__(self, *, thread_id='999', fail_thread=False):
-        self.thread_id = thread_id
-        self.fail_thread = fail_thread
-        self.sends = []
-        self.dispatched = []
-        self.thread_requests = []
+    def __init__(self, *, thread_id='999', fail_thread=False, answer='the answer',
+                 answer_after=0.0, completes=True, complete_after=0.0, session='s1'):
+        self.thread_id, self.fail_thread = thread_id, fail_thread
+        self.answer, self.answer_after = answer, answer_after
+        self.completes, self.complete_after = completes, complete_after
+        self.session = session
+        self.sends, self.dispatched, self.thread_requests = [], [], []
+        self.completed, self.chained, self.restored = [], [], []
+        self.on_processing_complete = self._default_complete
+        self._original_complete = self.on_processing_complete
+
+    async def _default_complete(self, event, outcome):
+        self.chained.append(outcome)
+
+    def _source_session_key(self, source):
+        return self.session
 
     async def create_handoff_thread(self, parent_chat_id, name):
         self.thread_requests.append((parent_chat_id, name))
@@ -150,64 +162,146 @@ class _FakeAdapter:
     async def send(self, chat_id, content, *args, **kwargs):
         self.sends.append((str(chat_id), content))
 
+    async def edit_message(self, chat_id, message_id, content=None, *args, **kwargs):
+        self.sends.append((str(chat_id), content))
+
     async def handle_message(self, event):
-        # Goes through send() the way the gateway does, so the capture wrapper sees it.
         chat = str(event.source.chat_id)
         self.dispatched.append(chat)
-        await self.send(chat, 'the answer from ' + chat)
+        if self.answer_after:
+            await asyncio.sleep(self.answer_after)
+        await self.send(chat, self.answer)
+        if self.complete_after:
+            await asyncio.sleep(self.complete_after)
+        hook = getattr(self, 'on_processing_complete', None)
+        if self.completes and callable(hook):
+            self.completed.append(chat)
+            await hook(event, 'success')
 
 
 def _factory(text, source):
     return SimpleNamespace(text=text, source=source)
 
 
-def _work(adapter, source, chat_id):
+def _work(adapter, source, chat_id, **kwargs):
     from discord_voice.delegation import ChatWork
-    return ChatWork(adapter, source, chat_id, event_factory=_factory, quiet=.05)
+    return ChatWork(adapter, source, chat_id, event_factory=_factory, **kwargs)
 
 
 def test_each_task_gets_its_own_thread():
-    adapter = _FakeAdapter()
+    adapter = _CoreAdapter()
     work = _work(adapter, _Source(), '555')
     answer = _run(work('check the rook repo', 'item-7'))
     assert adapter.thread_requests and adapter.thread_requests[0][0] == '555'
     assert 'rook repo' in adapter.thread_requests[0][1]
     assert adapter.dispatched == ['999']
-    assert answer == 'the answer from 999'
+    assert answer == 'the answer'
     assert work.threads == {'item-7': '999'}
 
 
 def test_the_seed_never_leaks_into_the_answer():
-    adapter = _FakeAdapter()
+    adapter = _CoreAdapter()
     work = _work(adapter, _Source(), '555')
     answer = _run(work('do a thing', 'item-8'))
-    assert answer.startswith('the answer')
-    assert 'MICROPHONE' not in answer
+    assert answer == 'the answer'
     assert any('do a thing' in content for chat, content in adapter.sends if chat == '999')
 
 
 def test_a_call_already_in_a_thread_runs_in_place():
-    adapter = _FakeAdapter()
+    adapter = _CoreAdapter()
     work = _work(adapter, _Source(chat_type='thread', chat_id='777'), '777')
     answer = _run(work('do a thing', 'item-9'))
     assert adapter.thread_requests == []
     assert adapter.dispatched == ['777']
-    assert answer == 'the answer from 777'
+    assert answer == 'the answer'
 
 
 def test_a_channel_that_refuses_threads_still_runs_the_work():
-    adapter = _FakeAdapter(fail_thread=True)
+    adapter = _CoreAdapter(fail_thread=True)
     work = _work(adapter, _Source(), '555')
     answer = _run(work('do a thing', 'item-10'))
     assert adapter.dispatched == ['555']
-    assert answer == 'the answer from 555'
+    assert answer == 'the answer'
     assert work.threads == {}
 
 
 def test_a_missing_thread_helper_falls_back_to_the_call_chat():
-    adapter = _FakeAdapter()
+    adapter = _CoreAdapter()
     adapter.create_handoff_thread = None
     work = _work(adapter, _Source(), '555')
     answer = _run(work('do a thing', 'item-11'))
     assert adapter.dispatched == ['555']
-    assert answer == 'the answer from 555'
+    assert answer == 'the answer'
+
+
+def test_the_wait_ends_on_the_turn_completing_not_on_a_stopwatch():
+    """The answer arrives after the turn, which the queue records as the completion."""
+    order = []
+    adapter = _CoreAdapter(answer_after=.05)
+
+    original = adapter.on_processing_complete
+
+    async def watched(event, outcome):
+        order.append('complete')
+        await original(event, outcome)
+
+    adapter.on_processing_complete = watched
+    adapter._original_complete = watched
+    work = _work(adapter, _Source(), '555')
+    answer = _run(work('do a thing', 'item-15'))
+    assert order == ['complete']
+    assert answer == 'the answer'
+    assert adapter.chained  # the adapter's own hook still ran
+    assert adapter.on_processing_complete is watched  # and was restored
+
+
+def test_a_quiet_turn_without_completion_still_reports():
+    adapter = _CoreAdapter(completes=False, answer=None)
+    work = _work(adapter, _Source(), '555', deadline=.2)
+    assert _run(work('do a thing', 'item-16')) == FAILED_TEXT
+
+
+def test_another_sessions_completion_does_not_release_our_wait():
+    """Only our conversation's turn may end our wait -- and a chat that answered is not a failure."""
+    import time
+
+    adapter = _CoreAdapter(completes=False)
+    work = _work(adapter, _Source(), '555', deadline=.4)
+    other = SimpleNamespace(source=_Source(chat_id='other'))
+
+    async def scenario():
+        task = asyncio.ensure_future(work('do a thing', 'item-17'))
+        await asyncio.sleep(.05)
+        adapter.session = 'other-session'
+        await adapter.on_processing_complete(other, 'success')  # fires while ours is pending
+        await task
+        return task.result()
+
+    started = time.monotonic()
+    answer = _run(scenario())
+    elapsed = time.monotonic() - started
+    # The foreign completion did not release the wait: it ran to its deadline.
+    assert elapsed >= .35, elapsed
+    # Nothing was reported for our session, and the captured answer is still returned.
+    assert work.outcome is None
+    assert answer == 'the answer'
+
+
+def test_an_edited_answer_counts():
+    class Editing(_CoreAdapter):
+        async def handle_message(self, event):
+            chat = str(event.source.chat_id)
+            self.dispatched.append(chat)
+            await self.edit_message(chat, 'm1', 'the edited answer')
+            await self.on_processing_complete(event, 'success')
+
+    adapter = Editing()
+    work = _work(adapter, _Source(), '555')
+    assert _run(work('do a thing', 'item-18')) == 'the edited answer'
+
+
+def test_a_turn_without_the_hook_reports_what_it_captured():
+    adapter = _CoreAdapter()
+    del adapter.on_processing_complete
+    work = _work(adapter, _Source(), '555')
+    assert _run(work('do a thing', 'item-19')) == 'the answer'

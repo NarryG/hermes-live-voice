@@ -118,17 +118,24 @@ class ChatWork:
     session, tools and permissions because the request is dispatched through the
     adapter's own inbound path. A call already running in a thread has nothing to nest
     into, and a channel that refuses thread creation falls back to the call's own chat.
+
+    The wait for the answer is session-aware: it ends when the gateway reports that THIS
+    conversation's turn completed, not after a guessed interval. An earlier version gave
+    up after 1.5 quiet seconds and told the call a task had failed while the chat was
+    still working on it for another twenty.
     """
 
-    def __init__(self, adapter, source, chat_id, *, quiet=QUIET_S, name_prefix='live voice: ',
-                 event_factory=None):
+    def __init__(self, adapter, source, chat_id, *, quiet=QUIET_S, deadline=None,
+                 name_prefix='live voice: ', event_factory=None):
         self.adapter = adapter
         self.source = source
         self.chat_id = str(chat_id)
         self.quiet = quiet
+        self.deadline = deadline
         self.name_prefix = name_prefix
         self.event_factory = event_factory or core_message_event
         self.threads = {}
+        self.outcome = None
         self._chat = self.chat_id
         self._parts = []
 
@@ -136,6 +143,10 @@ class ChatWork:
         # Drop-in for adapter.send, which callers await.
         if str(chat_id) == self._chat and isinstance(content, str) and content.strip():
             self._parts.append(content.strip())
+
+    async def _capture_edit(self, chat_id, message_id, content=None, *args, **kwargs):
+        # edit_message(chat_id, message_id, content) -- content is the third argument.
+        await self._capture(chat_id, content)
 
     async def _seed(self, chat_id, text):
         """Show the caller what was asked, so the thread reads on its own."""
@@ -164,6 +175,68 @@ class ChatWork:
         await self._seed(thread_id, text)
         return thread_id
 
+    def _session_key(self, source):
+        """The core's own key for this conversation, so the right turn is watched."""
+        derive = getattr(self.adapter, '_source_session_key', None)
+        if not callable(derive):
+            return None
+        try:
+            return derive(source)
+        except Exception:
+            logger.debug('Live Voice: no session key for delegated work', exc_info=True)
+            return None
+
+    def _keys_for(self, source):
+        derive = getattr(self.adapter, '_source_session_key', None)
+        if not callable(derive):
+            return None
+        try:
+            return derive(source)
+        except Exception:
+            return None
+
+    def _watch_turn(self, session_key):
+        """Watch THIS conversation's completion.
+
+        Installed BEFORE dispatch: a fast turn can finish while handle_message is still
+        running, and a hook installed afterwards misses that completion entirely (the
+        first version waited out its deadline with the answer already in hand).
+
+        Returns ``(completion, release)``; ``release`` restores the adapter's own hook.
+        """
+        completion = asyncio.Event()
+        original = getattr(self.adapter, 'on_processing_complete', None)
+        if not callable(original):
+            logger.warning('Live Voice: no completion hook on the adapter; reporting what was captured')
+            completion.set()
+            return completion, lambda: None
+
+        async def hooked(event, outcome):
+            try:
+                mine = self._keys_for(getattr(event, 'source', None))
+                if session_key is None or mine is None or mine == session_key:
+                    self.outcome = getattr(outcome, 'value', outcome)
+                    completion.set()
+            finally:
+                await original(event, outcome)
+
+        self.adapter.on_processing_complete = hooked
+
+        def release():
+            self.adapter.on_processing_complete = original
+
+        return completion, release
+
+    async def _turn_finished(self, completion, item_id=None):
+        if completion.is_set():
+            return True
+        try:
+            await asyncio.wait_for(completion.wait(), self.deadline)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning('Live Voice: the turn for item=%s has not completed yet', item_id)
+            return False
+
     async def __call__(self, text, item_id=None):
         from dataclasses import replace
 
@@ -173,17 +246,22 @@ class ChatWork:
             source = replace(self.source, chat_id=chat_id, chat_type='thread',
                              thread_id=chat_id, parent_chat_id=self.chat_id)
         event = self.event_factory(str(text), source)
-        send = self.adapter.send
-        self._chat, self._parts = chat_id, []
+        session_key = self._session_key(source)
+        send, edit = self.adapter.send, getattr(self.adapter, 'edit_message', None)
+        self._chat, self._parts, self.outcome = chat_id, [], None
         self.adapter.send = self._capture
+        if edit is not None:
+            self.adapter.edit_message = self._capture_edit
+        completion, release = self._watch_turn(session_key)
         try:
             await self.adapter.handle_message(event)
-            while True:
-                before = len(self._parts)
-                await asyncio.sleep(self.quiet)
-                if len(self._parts) == before:
-                    break
+            await self._turn_finished(completion, item_id)
+            if self.outcome == 'failure':
+                logger.warning('Live Voice: the turn for item=%s reported failure', item_id)
         finally:
+            release()
             self.adapter.send = send
+            if edit is not None:
+                self.adapter.edit_message = edit
         joined = '\n\n'.join(self._parts).strip()
         return joined or FAILED_TEXT

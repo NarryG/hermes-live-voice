@@ -159,6 +159,7 @@ class MediaLane:
         self._gate = asyncio.Event()
         self._changed = asyncio.Event()
         self._session_id = None
+        self._delegations = None
         self._started = False
         self._remote_audio = False
         self._closed = False
@@ -201,7 +202,12 @@ class MediaLane:
             elif event.kind == 'delegation':
                 if self.channel.readyState != 'open' or self.channel.bufferedAmount > 65536:
                     raise MediaRefused('control backpressure')
-                self.channel.send(json.dumps(delegation_refusal(event)))
+                if self._delegations is None or not self._delegations.submit(event.item_id, event.text):
+                    # No executor (client-managed call) or a full queue: refuse, never drop
+                    # the request silently.
+                    self.channel.send(json.dumps(delegation_refusal(event)))
+                    logger.warning('Live Voice: delegation refused item=%s (no executor or queue full)',
+                                   event.item_id)
             # Transcript deltas remain conversation-only; no executor/callback.
         except Exception:
             self._fail()
@@ -328,7 +334,37 @@ class MediaLane:
         await self.close()
         return 'unknown'  # no upstream V3 stop-ACK protocol has been established
 
+    def attach_delegations(self, queue):
+        """Give the lane something that can actually run what the call delegates."""
+        self._delegations = queue
+
+    def _delegation_result(self, item_id, text):
+        return {'type': 'delegation.context.append', 'delegation_item_id': item_id,
+                'content': [{'type': 'input_text', 'text': text}]}
+
+    async def report_delegation(self, item_id, text):
+        """Append a delegated result to the call; never raises into the RTP loop."""
+        try:
+            if self._closed or self.failed or self.channel is None or self.channel.readyState != 'open':
+                logger.warning('Live Voice: delegation result not delivered item=%s (lane closed)', item_id)
+                return
+            if self.channel.bufferedAmount > 65536:
+                await asyncio.sleep(.25)
+                if self.channel.readyState != 'open' or self.channel.bufferedAmount > 65536:
+                    logger.warning('Live Voice: delegation result not delivered item=%s (backpressure)', item_id)
+                    return
+            self.channel.send(json.dumps(self._delegation_result(item_id, text)))
+        except Exception:
+            logger.exception('Live Voice: delegation result send failed item=%s', item_id)
+
+    async def _stop_delegations(self):
+        queue = self._delegations
+        self._delegations = None
+        if queue is not None:
+            await queue.stop()
+
     async def close(self):
+        await self._stop_delegations()
         if self._closing is None:
             self._closed = True  # fence synchronously before the cleanup await
             self.ready = False
@@ -342,6 +378,7 @@ class MediaLane:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
         if self._track:
             self._track.stop()
         if self.pc:

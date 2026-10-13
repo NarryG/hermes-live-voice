@@ -147,6 +147,46 @@ class Session:
         if self.lane:
             self.lane.drain()
 
+    def _attach_delegations(self):
+        """Phase 1: run what the call delegates in the chat it was started from.
+
+        Only when the lane was told it may delegate; a client-managed call keeps the
+        refusal path untouched.
+        """
+        if getattr(self.manager.lane_factory, 'delegation', 'client') != 'server':
+            return
+        attach = getattr(self.lane, 'attach_delegations', None)
+        if not callable(attach):
+            return
+        try:
+            attach(self.delegation_queue())
+        except Exception:
+            # A call must still start when the executor cannot be wired (older core,
+            # missing session types): the lane then refuses delegated work as before.
+            logger.exception('Live Voice: no delegation executor for this call')
+
+    def delegation_queue(self):
+        from gateway.session import SessionSource
+
+        from .delegation import ChatWork, DelegationQueue
+        b = self.binding
+        text = self.text_channel
+        parent = getattr(text, 'parent', None)
+        is_thread = parent is not None or type(text).__name__ == 'Thread'
+        owner = getattr(b, 'owner', None) or getattr(b, 'user', None) or b[0]
+        source = SessionSource(
+            platform=getattr(self.manager.adapter, 'platform', None), chat_id=str(b.text),
+            chat_name=getattr(text, 'name', None),
+            chat_type='thread' if is_thread else 'channel',
+            user_id=str(owner), user_name=getattr(getattr(text, 'guild', None), 'name', None),
+            thread_id=str(b.text) if is_thread else None,
+            parent_chat_id=str(getattr(parent, 'id', '') or '') or None,
+            scope_id=str(b.guild), guild_id=str(b.guild), profile=b.profile)
+        work = ChatWork(self.manager.adapter, source, str(b.text))
+        logger.warning('Live Voice: delegations run in chat=%s (%s)', b.text,
+                       'thread' if is_thread else 'channel')
+        return DelegationQueue(work, self.lane.report_delegation).start()
+
     async def activate(self):
         if getattr(self.manager.lane_factory, 'admitted', False) is not True:
             raise RuntimeError('No admitted voice transport.')
@@ -155,6 +195,7 @@ class Session:
         self.state = 'starting'
         self.drain()
         self.lane = self.manager.lane_factory()
+        self._attach_delegations()
         await self.lane.start(self.manager.prompt, self.manager.voice)
         supported_version = getattr(self.manager.lane_factory, 'supported_version', None)
         if (not isinstance(supported_version, str) or not supported_version

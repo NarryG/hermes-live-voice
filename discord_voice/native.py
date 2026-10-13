@@ -219,7 +219,7 @@ class NativeHandle:
         captured = selected_capture if selected_capture is not None else capture_selection(scope.home)
         owner = SelectedCLIOwner(adapter, scope, captured, scope_guard=lambda:
             adapter._client is native and self.manager.scope_guard())
-        self.manager.lane_factory = SelectedLaneFactory(owner)
+        self.manager.lane_factory = SelectedLaneFactory(owner, delegation=delegation)
 
         async def livevoice(interaction: discord.Interaction,
                             operation: Literal['start', 'pause', 'resume', 'stop', 'status', 'consent', 'revoke']):

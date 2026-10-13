@@ -426,12 +426,14 @@ class SelectedLaneFactory:
     """Implementation admission is not account readiness or live entitlement."""
     admitted = True
     supported_version = 'v3'
+    delegation = 'client'
     processing_disclosure = ('Admitted participant audio goes to the already-selected Codex CLI '
         'ChatGPT subscription via direct WebRTC. Normal native CLI metadata/cache loading '
         'and renewal of its existing login may occur after opt-in. No task executor is attached.')
 
-    def __init__(self, owner, *, http_post=None, startup_timeout=10):
+    def __init__(self, owner, *, http_post=None, startup_timeout=10, delegation='client'):
         self._owner = owner
+        self.delegation = delegation
         self._http_post, self._timeout = http_post, startup_timeout
         self._factory = None
         self._lock = asyncio.Lock()

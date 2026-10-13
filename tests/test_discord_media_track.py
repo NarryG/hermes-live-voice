@@ -44,16 +44,25 @@ def test_appending_bad_pcm_still_refuses():
         asyncio.run(track.append(b'\x01'))
 
 
-def test_silence_where_audio_was_expected_is_counted():
-    """An underrun is what a listener hears as stuttering."""
+def test_a_quiet_call_is_not_counted_as_a_dropout():
+    """Silence with no audio flowing is normal; a dropout is silence mid-sentence."""
     track = PCMTrack(_gate(), lambda: None)
-    assert track.stats()['underruns'] == 0
-    asyncio.run(track.recv())
     asyncio.run(track.recv())
     counters = track.stats()
-    assert counters['frames'] == 2
-    assert counters['underruns'] == 2      # nothing was ever queued
-    assert set(counters) == {'frames', 'underruns', 'late_rebases', 'max_queue', 'queued_bytes'}
+    assert counters['frames'] == 1
+    assert counters['underruns'] == 1      # nothing buffered
+    assert counters['dropouts'] == 0       # but no audio had been flowing
+    assert set(counters) == {'frames', 'underruns', 'dropouts', 'late_rebases',
+                             'max_queue', 'queued_bytes'}
+
+
+def test_silence_right_after_audio_is_counted_as_a_dropout():
+    track = PCMTrack(_gate(), lambda: None)
+    asyncio.run(track.append(b'\x11' * 960))
+    asyncio.run(track.recv())              # consumes the audio
+    asyncio.run(track.recv())              # immediately after: nothing left
+    counters = track.stats()
+    assert counters['dropouts'] == 1
 
 
 def test_buffered_audio_is_not_an_underrun():

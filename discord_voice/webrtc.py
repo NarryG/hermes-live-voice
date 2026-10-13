@@ -91,14 +91,17 @@ class PCMTrack(AudioStreamTrack):
         # Counters for what a listener actually hears: silence where audio was expected.
         self.frames_out = 0
         self.underruns = 0
+        self.dropouts = 0
         self.late_rebases = 0
         self.max_queue = 0
+        self.last_audio = None
 
     async def append(self, pcm):
         if not isinstance(pcm, bytes) or len(pcm) % 2 or len(pcm) > 480000:
             raise MediaRefused('invalid PCM24 mono input')
         async with self.lock:
             self.pending += pcm
+            self.last_audio = asyncio.get_running_loop().time()
             while len(self.pending) >= 960:
                 self.scope()
                 await self.frames.put(self.pending[:960])
@@ -123,7 +126,7 @@ class PCMTrack(AudioStreamTrack):
         if self.origin is None:
             self.origin = loop.time()
         target = self.origin + self.pts / 24000
-        if loop.time() - target > .02:
+        if loop.time() - target > .06:
             # Keep sample timestamps contiguous but rebase wall time after stalls;
             # never burst overdue frames or discard buffered participant speech.
             self.origin = loop.time() - self.pts / 24000
@@ -134,8 +137,12 @@ class PCMTrack(AudioStreamTrack):
         try:
             pcm = self.frames.get_nowait()
         except asyncio.QueueEmpty:
-            # Nothing buffered: the call hears silence here. This is stuttering.
+            # Nothing buffered. That is a dropout only if audio was flowing a moment ago;
+            # a quiet call is not a fault, and counting it as one hid the real cause.
             self.underruns += 1
+            now = loop.time()
+            if self.last_audio is not None and now - self.last_audio < .25:
+                self.dropouts += 1
             pcm = b'\x00' * 960
         self.frames_out += 1
         self.max_queue = max(self.max_queue, self.frames.qsize())
@@ -147,8 +154,8 @@ class PCMTrack(AudioStreamTrack):
 
     def stats(self):
         return {'frames': self.frames_out, 'underruns': self.underruns,
-                'late_rebases': self.late_rebases, 'max_queue': self.max_queue,
-                'queued_bytes': len(self.pending)}
+                'dropouts': self.dropouts, 'late_rebases': self.late_rebases,
+                'max_queue': self.max_queue, 'queued_bytes': len(self.pending)}
 
     def drain(self):
         self.pending = b''
@@ -239,10 +246,11 @@ class MediaLane:
                 if self._closed or self._track is None:
                     continue
                 counters = self._track.stats()
-                logger.warning('Live Voice audio: frames=%d underruns=%d late_rebases=%d max_queue=%d '
-                               'queued_bytes=%d buffered=%s ready=%s',
-                               counters['frames'], counters['underruns'], counters['late_rebases'],
-                               counters['max_queue'], counters['queued_bytes'],
+                logger.warning('Live Voice audio: frames=%d underruns=%d dropouts=%d late_rebases=%d '
+                               'max_queue=%d queued_bytes=%d buffered=%s ready=%s',
+                               counters['frames'], counters['underruns'], counters['dropouts'],
+                               counters['late_rebases'], counters['max_queue'],
+                               counters['queued_bytes'],
                                getattr(self.channel, 'bufferedAmount', None), self.ready)
         except asyncio.CancelledError:
             raise

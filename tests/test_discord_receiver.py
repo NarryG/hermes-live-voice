@@ -73,7 +73,10 @@ def test_receiver_exact_mapping_only_bounded_and_restores_own_hooks():
     old = conn.hook
     received = []
     valid = [True]
-    rx = m.new_receiver(ReceiverFixture, NS(_connection=conn), 123, lambda: valid[0], received.append)
+    # A multi-participant lane keeps exact-mapping semantics: only an SSRC that a
+    # SPEAKING event mapped is admitted (a sole participant IS inferred, which is
+    # what the two tests below cover).
+    rx = m.new_receiver(ReceiverFixture, NS(_connection=conn), {123, 789}, lambda: valid[0], received.append)
     rx.start()
     rx._on_packet(packet(4))  # unknown never decoded
     rx.map_ssrc(4, '123')  # raw malformed mapping never an integer identity
@@ -163,3 +166,57 @@ def test_receiver_partial_start_rolls_back():
     except RuntimeError:
         pass
     assert conn.hook is old and conn.ws._hook is old and not conn.listeners
+
+def test_sole_participant_is_inferred_so_the_lane_is_not_deaf():
+    """One participant, no SPEAKING event (they were already talking at join)."""
+    received = []
+    rx = module('receiver').new_receiver(ReceiverFixture, NS(_connection=connection()),
+        123, lambda: True, received.append)
+    rx.start()
+    rx._on_packet(packet(4))  # was dropped forever before the fix
+    assert [item.speaker for item in received] == [123]
+    assert received[0].pcm == b'\x01' * 3840
+    rx.stop()
+
+
+def test_unmapped_ssrc_with_multiple_participants_stays_dropped():
+    """Multi-user lanes must not attribute an unknown SSRC to whoever is first."""
+    received = []
+    rx = module('receiver').new_receiver(ReceiverFixture, NS(_connection=connection()),
+        {123, 789}, lambda: True, received.append)
+    rx.start()
+    rx._on_packet(packet(4))
+    assert not received
+    rx.stop()
+
+
+def test_speaking_events_map_each_participant_for_multi_user_lanes():
+    """Every participant's SPEAKING event maps their own SSRC, not just the owner."""
+    import asyncio as _asyncio
+    received = []
+    conn = connection()
+    rx = module('receiver').new_receiver(ReceiverFixture, NS(_connection=conn),
+        {123, 789}, lambda: True, received.append)
+    rx.start()
+    hook = conn.hook
+    for ssrc, uid in ((4, 123), (9, 789)):
+        _asyncio.run(hook(None, {'op': 5, 'd': {'ssrc': ssrc, 'user_id': uid}}))
+    rx._on_packet(packet(4))
+    rx._on_packet(packet(9))
+    assert sorted(item.speaker for item in received) == [123, 789]
+    rx.stop()
+    assert not conn.listeners
+
+
+def test_speaking_hook_is_removed_with_the_receiver():
+    """The mapping hook must not outlive the lane's receiver."""
+    import asyncio as _asyncio
+    conn = connection()
+    original = conn.hook
+    rx = module('receiver').new_receiver(ReceiverFixture, NS(_connection=conn), 123, lambda: True, lambda item: None)
+    rx.start()
+    assert conn.hook is not original
+    _asyncio.run(conn.hook(None, {'op': 5, 'd': {'ssrc': 4, 'user_id': 123}}))
+    assert rx._ssrc_to_user.get(4) == 123
+    rx.stop()
+    assert conn.hook is original

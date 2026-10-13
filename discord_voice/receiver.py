@@ -30,6 +30,9 @@ def new_receiver(base, voice_client, owner, guard, deliver):
             self._seen = set()
             self._drops = 0
             self._delivered = 0
+            self._mapped = 0
+            self._speaking_installed = None
+            self._speaking_previous = None
             self._snapshot = None
             self._installed = None
 
@@ -61,6 +64,38 @@ def new_receiver(base, voice_client, owner, guard, deliver):
                 self.stop()
                 raise
             self._installed = conn.hook
+            self._install_speaking_map(conn, ws)
+
+        def _install_speaking_map(self, conn, ws):
+            """Record SPEAKING events into this receiver's own SSRC map.
+
+            The host keeps its map on its own receiver object, so a lane receiver
+            never learned any SSRC and dropped every frame it received. The wrapped
+            hook chains to the previous one, so nothing the host did is lost.
+            """
+            previous = conn.hook
+            receiver = self
+
+            async def mapped_hook(sock, msg):
+                try:
+                    if isinstance(msg, dict) and msg.get('op') == 5:
+                        data = msg.get('d') or {}
+                        ssrc, uid = data.get('ssrc'), data.get('user_id')
+                        if ssrc and uid:
+                            receiver.map_ssrc(int(ssrc), int(uid))
+                            if receiver._mapped < 10:
+                                receiver._mapped += 1
+                                logger.warning('Live Voice rx: mapped ssrc=%s -> user=%s (speaking event)', ssrc, uid)
+                except Exception:
+                    logger.warning('Live Voice rx: speaking map failed', exc_info=True)
+                if previous is not None:
+                    await previous(sock, msg)
+
+            conn.hook = mapped_hook
+            if ws is not None:
+                ws._hook = mapped_hook
+            self._speaking_installed = mapped_hook
+            self._speaking_previous = previous
 
         def stop(self):
             try:
@@ -76,6 +111,25 @@ def new_receiver(base, voice_client, owner, guard, deliver):
                     if live_ws is not ws and getattr(live_ws, '_hook', None) is self._installed:
                         live_ws._hook = old
                     self._snapshot = None
+                installed = self._speaking_installed
+                if installed is not None:
+                    previous = self._speaking_previous
+                    for target in (conn, ws, getattr(conn, 'ws', None)):
+                        if target is None:
+                            continue
+                        if getattr(target, 'hook', None) is installed:
+                            target.hook = previous
+                        if getattr(target, '_hook', None) is installed:
+                            target._hook = previous
+                    self._speaking_installed = None
+                    self._speaking_previous = None
+                for target in (conn, ws, getattr(conn, 'ws', None)):
+                    if target is None:
+                        continue
+                    if getattr(target, 'hook', None) is self._installed:
+                        target.hook = old
+                    if getattr(target, '_hook', None) is self._installed:
+                        target._hook = ws_old
                 self._rejected.clear()
                 self._seen.clear()
 
@@ -84,13 +138,25 @@ def new_receiver(base, voice_client, owner, guard, deliver):
                 return
             ssrc = struct.unpack_from('>I', packet, 8)[0]
             with self._lock:
-                if not self._running or not guard() or self._ssrc_to_user.get(ssrc) not in owners or ssrc in self._rejected:
+                mapped = self._ssrc_to_user.get(ssrc)
+                if mapped is None and len(owners) == 1:
+                    # Discord does not re-announce a SPEAKING event for someone who was
+                    # already talking when the lane joined, so with exactly one
+                    # participant the frame can only be theirs: adopt it. With more
+                    # than one participant this stays strict and the mapping comes
+                    # from the SPEAKING events recorded above.
+                    mapped = next(iter(owners))
+                    self.map_ssrc(ssrc, mapped)
+                    mapped = self._ssrc_to_user.get(ssrc)
+                    if self._mapped < 10:
+                        self._mapped += 1
+                        logger.warning('Live Voice rx: inferred ssrc=%s -> user=%s (sole lane participant)', ssrc, mapped)
+                if not self._running or not guard() or mapped not in owners or ssrc in self._rejected:
                     self._buffers.clear()
                     if self._drops < 10:
                         self._drops += 1
-                        logger.warning('Live Voice rx: dropping ssrc=%s (running=%s guard=%s mapped=%s rejected=%s)',
-                                    ssrc, self._running, bool(guard()),
-                                    self._ssrc_to_user.get(ssrc), ssrc in self._rejected)
+                        logger.warning('Live Voice rx: dropping ssrc=%s (running=%s guard=%s mapped=%s owners=%s rejected=%s)',
+                                    ssrc, self._running, bool(guard()), mapped, sorted(owners), ssrc in self._rejected)
                     return
                 super()._on_packet(packet)
                 # Host only buffers one decoded Opus packet before we drain.

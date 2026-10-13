@@ -224,37 +224,6 @@ class NativeHandle:
             adapter._client is native and self.manager.scope_guard())
         self.manager.lane_factory = SelectedLaneFactory(owner, delegation=delegation)
 
-async def respond_to_command(interaction, operation, manager, *, logger=logger):
-    """Acknowledge Discord's interaction first, then answer with the outcome.
-
-    Discord expires an unacknowledged interaction after three seconds and shows
-    "The application did not respond". The acknowledgement is therefore best effort and
-    the answer goes through the follow-up, which still works after expiry -- a slow
-    authorization step must not turn into a silent command.
-    """
-    deferred = False
-    try:
-        await interaction.response.defer(ephemeral=True)
-        deferred = True
-    except Exception:
-        logger.warning('Live Voice: could not acknowledge /livevoice %s (likely expired)', operation,
-                       exc_info=True)
-    try:
-        message = await manager.command(interaction, operation)
-    except Exception:
-        logger.warning('Live Voice: /livevoice %s raised', operation, exc_info=True)
-        message = 'Voice operation failed; status is unknown. No upstream details are disclosed.'
-    logger.warning('Live Voice: /livevoice %s by user=%s -> %s', operation,
-                   getattr(getattr(interaction, 'user', None), 'id', '?'), message)
-    try:
-        await interaction.followup.send(message, ephemeral=True)
-        return message
-    except Exception:
-        logger.warning('Live Voice: could not deliver the /livevoice %s reply (acknowledged=%s)',
-                       operation, deferred, exc_info=True)
-        return message
-
-
         async def livevoice(interaction: discord.Interaction,
                             operation: Literal['start', 'pause', 'resume', 'stop', 'status', 'consent', 'revoke']):
             if self.closed or self.manager.closed.is_set():
@@ -445,6 +414,36 @@ async def respond_to_command(interaction, operation, manager, *, logger=logger):
             if self.remote or self.manager.sessions:
                 logging.getLogger(__name__).warning('Live Voice cleanup remains pending; ownership retained. Retry cleanup on this handle; operator reconciliation may be required.')
 
+
+async def respond_to_command(interaction, operation, manager, *, logger=logger):
+    """Acknowledge Discord's interaction first, then answer with the outcome.
+
+    Discord expires an unacknowledged interaction after three seconds and shows
+    "The application did not respond". The acknowledgement is therefore best effort and
+    the answer goes through the follow-up, which still works after expiry -- a slow
+    authorization step must not turn into a silent command.
+    """
+    deferred = False
+    try:
+        await interaction.response.defer(ephemeral=True)
+        deferred = True
+    except Exception:
+        logger.warning('Live Voice: could not acknowledge /livevoice %s (likely expired)', operation,
+                       exc_info=True)
+    try:
+        message = await manager.command(interaction, operation)
+    except Exception:
+        logger.warning('Live Voice: /livevoice %s raised', operation, exc_info=True)
+        message = 'Voice operation failed; status is unknown. No upstream details are disclosed.'
+    logger.warning('Live Voice: /livevoice %s by user=%s -> %s', operation,
+                   getattr(getattr(interaction, 'user', None), 'id', '?'), message)
+    try:
+        await interaction.followup.send(message, ephemeral=True)
+        return message
+    except Exception:
+        logger.warning('Live Voice: could not deliver the /livevoice %s reply (acknowledged=%s)',
+                       operation, deferred, exc_info=True)
+        return message
 
 def install(native, adapter, home, receiver_class=None, *, selected_capture=None):
     if receiver_class is None:

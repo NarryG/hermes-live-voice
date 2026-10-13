@@ -434,11 +434,14 @@ def test_native_registration_uses_existing_bot_and_removes_only_own_handlers(tmp
 
 
 class _Resp:
-    def __init__(self):
-        self.deferred = 0
+    def __init__(self, interaction, fail=False):
+        self.interaction = interaction
+        self.fail = fail
 
     async def defer(self, **kwargs):
-        self.deferred += 1
+        if self.fail:
+            raise RuntimeError('Unknown interaction')
+        self.interaction.deferred += 1
 
 
 class _Follow:
@@ -454,15 +457,10 @@ class _Follow:
 
 class _Interaction:
     def __init__(self, defer_fails=False, follow_fails=False):
-        self.response = _Resp()
+        self.deferred = 0
+        self.response = _Resp(self, fail=defer_fails)
         self.followup = _Follow(fail=follow_fails)
         self.user = type('U', (), {'id': 42})()
-        self._defer_fails = defer_fails
-
-    async def _defer(self, **kwargs):
-        if self._defer_fails:
-            raise RuntimeError('Unknown interaction')
-        return await self.response.defer(**kwargs)
 
 
 def test_the_command_acknowledges_before_doing_the_work():
@@ -472,15 +470,10 @@ def test_the_command_acknowledges_before_doing_the_work():
 
     class Manager:
         async def command(self, interaction, operation):
-            assert interaction.response.deferred == 1, 'must acknowledge before working'
+            assert interaction.deferred == 1, 'must acknowledge before working'
             return 'Voice started.'
 
     interaction = _Interaction()
-
-    async def defer(**kwargs):
-        await _Interaction._defer(interaction, **kwargs)
-
-    interaction.response.defer = defer
     message = asyncio.run(respond_to_command(interaction, 'start', Manager()))
     assert message == 'Voice started.'
     assert interaction.followup.sent == ['Voice started.']
@@ -496,13 +489,9 @@ def test_an_expired_interaction_still_gets_its_answer():
             return 'Voice started.'
 
     interaction = _Interaction(defer_fails=True)
-
-    async def defer(**kwargs):
-        raise RuntimeError('Unknown interaction')
-
-    interaction.response.defer = defer
     message = asyncio.run(respond_to_command(interaction, 'start', Manager()))
     assert message == 'Voice started.'
+    assert interaction.deferred == 0
     assert interaction.followup.sent == ['Voice started.']
 
 
@@ -520,3 +509,14 @@ def test_a_raising_command_never_leaks_details():
     assert 'PRIVATE SECRET' not in message
     assert message.startswith('Voice operation failed')
     assert interaction.followup.sent == [message]
+
+
+def test_the_lane_command_is_still_registered_by_the_handle():
+    """A helper inserted at module level once swallowed the registration entirely."""
+    import inspect
+
+    from discord_voice import native as native_module
+
+    source = inspect.getsource(native_module)
+    line = next(l for l in source.splitlines() if 'self.command = app_commands.Command(name=' in l)
+    assert line.startswith('        '), 'registration must stay inside the handle setup: %r' % line

@@ -49,9 +49,17 @@ fi
 
 say "3. publish into $PLUGIN (with backup)"
 mkdir -p /opt/data/backups/live-voice
+# Move stale copies OUT of the plugins directory: every superseded dir still declares
+# the same plugin id, and the loader then has four candidates — it can (and did)
+# import an old one, so deploys looked like no-ops.
+for stale in "$PLUGIN".superseded-*; do
+  [ -d "$stale" ] || continue
+  mv "$stale" "/opt/data/backups/live-voice/plugin-$(basename "$stale")"
+  say "  moved stale $(basename "$stale") out of the plugins dir"
+done
 cp -a "$PLUGIN" "/opt/data/backups/live-voice/plugin-$TS-pre-${SHA:0:7}"
 cp -a "$STAGE" "$PLUGIN.new"
-mv "$PLUGIN" "$PLUGIN.superseded-$TS"
+mv "$PLUGIN" "/opt/data/backups/live-voice/plugin-$TS-superseded"
 mv "$PLUGIN.new" "$PLUGIN"
 chown -R 10000:10000 "$PLUGIN"
 find "$PLUGIN" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null

@@ -15,6 +15,10 @@ from .broker import V3_VOICES
 
 logger = logging.getLogger(__name__)
 
+# Every boot states which copy of the plugin is live. Deploys silently looked like
+# no-ops when the loader picked a stale same-id directory, and nothing said so.
+logger.warning('Live Voice: native lane module loaded from %s', __file__)
+
 
 def normalize_settings(settings):
     settings = settings if isinstance(settings, dict) else {}

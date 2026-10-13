@@ -80,7 +80,7 @@ def delegation_refusal(event):
 
 class PCMTrack(AudioStreamTrack):
     """Bounded native mixed PCM input, paced by the local RTP sample clock."""
-    CUSHION_FRAMES = 3      # 60ms of slack before sending; bounds added latency
+    CUSHION_FRAMES = 6      # 120ms of slack before sending; bounds added latency
 
     def __init__(self, gate, scope):
         super().__init__()

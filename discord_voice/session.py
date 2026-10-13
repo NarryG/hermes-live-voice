@@ -61,6 +61,8 @@ class Session:
         self.rx_droughts = 0
         self.rx_overflows = 0
         self.rx_report = time.monotonic()
+        self.out_min = 10 ** 9
+        self.out_empty = 0
 
     def interaction(self, uid=None):
         b = self.binding
@@ -265,6 +267,14 @@ class Session:
                     pcm = mixer.pop_ready(time.monotonic())
                     if pcm and self.guard(epoch):
                         append_task = asyncio.create_task(lane.append(pcm))
+                # What the caller hears: the playback source holds up to 500ms, so watch
+                # how deep it actually runs -- depth near zero is an audible gap, however
+                # healthy the rest of the pipeline looks.
+                depth = source.buffered_bytes
+                if depth < self.out_min:
+                    self.out_min = depth
+                if depth == 0:
+                    self.out_empty += 1
                 if not pending_output and source.buffered_bytes < source.limit and not lane.audio.empty():
                     pcm = lane.audio.get_nowait()
                     if len(pcm) > 48000 or len(pcm) % 2:
@@ -277,10 +287,13 @@ class Session:
                 if now - self.rx_report >= 10.0:
                     self.rx_report = now
                     logger.warning('Live Voice rx leg: packets=%d maxgap=%.3f droughts=%d '
-                                   'overflows=%d inbound=%d mixer_ready=%d',
+                                   'overflows=%d inbound=%d mixer_ready=%d '
+                                   'playback_min=%d playback_empty=%d provider_q=%d',
                                    self.rx_packets, self.rx_maxgap, self.rx_droughts,
                                    self.rx_overflows, self.incoming.qsize(),
-                                   0 if append_task is not None else 1)
+                                   0 if append_task is not None else 1,
+                                   self.out_min, self.out_empty, lane.audio.qsize())
+                    self.out_min = source.limit
                 await asyncio.sleep(.01)
         except asyncio.CancelledError:
             raise

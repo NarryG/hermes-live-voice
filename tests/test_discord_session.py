@@ -577,3 +577,38 @@ def test_explicit_owner_lane_complete_offline_pcm_pause_resume_stop():
         assert not manager.sessions and channel.guild.voice_client is None
         assert not adapter._voice_clients
     asyncio.run(scenario())
+
+
+def test_a_stopped_call_does_not_block_the_next_start():
+    """/livevoice stop said "Voice stopped." and the next start was refused as reserved."""
+    async def scenario():
+        native, adapter, interaction, channel, _ = boundaries()
+        manager = implementation().SessionManager(native, adapter, ReceiverFixture, FixtureLane)
+        try:
+            assert 'started' in await confirmed(manager, interaction, 'start')
+            assert manager.sessions
+            assert 'stopped' in (await manager.command(interaction, 'stop')).lower()
+            assert manager.sessions == {}, manager.sessions
+            again = await confirmed(manager, interaction, 'start')
+            assert 'already reserved' not in again, again
+            assert 'started' in again, again
+            await manager.command(interaction, 'stop')
+        finally:
+            await manager.close()
+    asyncio.run(scenario())
+
+
+def test_a_session_left_under_another_key_is_still_released():
+    async def scenario():
+        native, adapter, interaction, channel, _ = boundaries()
+        manager = implementation().SessionManager(native, adapter, ReceiverFixture, FixtureLane)
+        try:
+            assert 'started' in await confirmed(manager, interaction, 'start')
+            session = next(iter(manager.sessions.values()))
+            manager.sessions.clear()
+            manager.sessions['some-other-key'] = session        # stale, differently-keyed
+            assert 'stopped' in (await manager.command(interaction, 'stop')).lower()
+            assert manager.sessions == {}, manager.sessions
+        finally:
+            await manager.close()
+    asyncio.run(scenario())

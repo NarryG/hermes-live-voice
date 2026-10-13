@@ -406,8 +406,13 @@ class SessionManager:
         if session.vc and (session.guild.voice_client is session.vc or session.vc.is_connected()):
             session.state = 'cleanup_pending'
             return 'cleanup_pending'
-        if self.sessions.get(session.binding.guild) is session:
-            self.sessions.pop(session.binding.guild)
+        # Remove by identity: the start path stores the session under the guild id it
+        # derives, which is not always the same value as binding.guild, and a leftover
+        # entry makes every later /livevoice start answer "already reserved" while nothing
+        # is actually running.
+        for key, value in list(self.sessions.items()):
+            if value is session:
+                self.sessions.pop(key, None)
         session.state = 'stopped'
         if session.reserved:
             session.reserved = False
@@ -481,6 +486,12 @@ class SessionManager:
                     return 'Voice startup failed; local audio stopped.'
             if operation != 'start':
                 return 'No matching voice operation for the current state.'
+            # A stopped session is not a reservation; never let one block a fresh call.
+            for key, value in list(self.sessions.items()):
+                if getattr(value, 'state', None) == 'stopped':
+                    self.sessions.pop(key, None)
+                    if session is value:
+                        session = None
             if session or self.sessions:
                 return 'A voice session is already reserved for this profile.'
             if interaction.guild.voice_client is not None or self.adapter._voice_clients.get(guild_id) is not None:

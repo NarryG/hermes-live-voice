@@ -263,6 +263,7 @@ class MediaLane:
             await self.close()
             if isinstance(error, asyncio.CancelledError):
                 raise
+            logger.warning('Live Voice: provider media startup failed', exc_info=True)
             raise MediaRefused('provider media startup failed') from None
 
     async def _watch_scope(self):

@@ -525,6 +525,8 @@ class SessionManager:
                     _OVERALL_CAPACITY.release()
                 if not isinstance(error, Exception):
                     raise
+                # Name the cause: a bare "startup failed" hid a working stack before.
+                logger.warning('Live Voice: startup failed; local audio stopped', exc_info=True)
                 return 'Voice startup failed; local audio stopped.'
 
     def fence(self):

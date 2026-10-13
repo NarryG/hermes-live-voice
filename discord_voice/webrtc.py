@@ -7,6 +7,7 @@ from fractions import Fraction
 
 import av
 from aiortc import AudioStreamTrack, RTCConfiguration, RTCPeerConnection, RTCSessionDescription, RTCRtpSender
+from aiortc.mediastreams import MediaStreamError
 
 from .broker import ScopeRefused, validate_sdp
 
@@ -95,9 +96,21 @@ class PCMTrack(AudioStreamTrack):
                 await self.frames.put(self.pending[:960])
                 self.pending = self.pending[960:]
 
+    async def _require_live(self):
+        """End the sender cleanly when the lane is gone.
+
+        aiortc treats MediaStreamError as an orderly end of a track; letting
+        MediaRefused escape logs a traceback out of the RTP loop and cuts audio
+        mid-sentence, which reaches the call as stuttering and dropouts.
+        """
+        try:
+            self.scope()
+        except MediaRefused as exc:
+            raise MediaStreamError(str(exc)) from None
+
     async def recv(self):
         await self.gate.wait()
-        self.scope()
+        await self._require_live()
         loop = asyncio.get_running_loop()
         if self.origin is None:
             self.origin = loop.time()
@@ -108,7 +121,7 @@ class PCMTrack(AudioStreamTrack):
             self.origin = loop.time() - self.pts / 24000
             target = loop.time()
         await asyncio.sleep(max(0, target - loop.time()))
-        self.scope()
+        await self._require_live()
         try:
             pcm = self.frames.get_nowait()
         except asyncio.QueueEmpty:

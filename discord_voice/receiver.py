@@ -167,7 +167,9 @@ def new_receiver(base, voice_client, owner, guard, deliver):
                 if pcm and len(pcm) <= 23040 and guard():
                     if self._delivered < 10:
                         self._delivered += 1
-                        logger.warning('Live Voice rx: delivering %d bytes from user=%s', len(pcm), self._ssrc_to_user[ssrc])
+                        # Per-packet logging writes a line every 10 ms and starves the
+                        # audio path on a small box: keep it at debug.
+                        logger.debug('Live Voice rx: delivering %d bytes from user=%s', len(pcm), self._ssrc_to_user[ssrc])
                     deliver(SpeakerPCM(self._ssrc_to_user[ssrc], time.monotonic(),
                                        struct.unpack_from('>I', packet, 4)[0], pcm))
 

@@ -458,3 +458,31 @@ def test_the_pointer_does_not_end_up_in_the_answer():
     work = _work(adapter, _Source(), '555')
     answer = _run(work('do a thing', 'item-23'))
     assert '<#999>' not in answer
+
+
+def test_two_tasks_at_once_do_not_nest_their_observers():
+    """Per-task wrapping made one wrapper call another; that raised RecursionError."""
+    import asyncio as _aio
+
+    class Slow(_CoreAdapter):
+        async def handle_message(self, event):
+            chat = str(event.source.chat_id)
+            self.dispatched.append(chat)
+            await _aio.sleep(.05)
+            await self.send(chat, 'answer for ' + chat)
+            await self.on_processing_complete(event, 'success')
+
+    adapter = Slow()
+    from discord_voice.delegation import router_for
+    first = _work(adapter, _Source(chat_id='555'), '555')
+    second = _work(adapter, _Source(chat_id='555'), '555')
+    async def main():
+        return await _aio.gather(first('one', 'a'), second('two', 'b'))
+
+    answers = _run(main())
+    assert answers == ['answer for 999', 'answer for 999']
+
+    installed = adapter.send
+    assert installed is router_for(adapter).send      # one observer, shared
+    _run(first('three', 'c'))                          # time passes, more work runs
+    assert adapter.send is installed                   # never re-wrapped or clobbered

@@ -118,6 +118,68 @@ def core_message_event(text, source):
                         user_name=getattr(source, 'user_name', None))
 
 
+_ROUTER_ATTR = '_live_voice_send_router'
+
+
+class SendRouter:
+    """One observer on the adapter, shared by every task watching for an answer.
+
+    Wrapping ``adapter.send`` per task looked simple and was not: with several tasks
+    running at once, each read the adapter's *current* send (often another task's wrapper)
+    and installed its own over it, so the wrappers could chain -- or point at each other,
+    which raised "maximum recursion depth exceeded" and made the call report that a task
+    could not be run. There is exactly one wrapper per adapter, it always calls the real
+    send, and it hands the result to whichever tasks are currently watching.
+    """
+
+    def __init__(self, adapter):
+        self.adapter = adapter
+        self._original_send = adapter.send
+        self._original_edit = getattr(adapter, 'edit_message', None)
+        self._watchers = set()
+        adapter.send = self.send
+        if self._original_edit is not None:
+            adapter.edit_message = self.edit
+
+    async def send(self, chat_id, content, *args, **kwargs):
+        result = await self._original_send(chat_id, content, *args, **kwargs)
+        self._notify(chat_id, content)
+        return result
+
+    async def edit(self, chat_id, message_id, content=None, *args, **kwargs):
+        result = None
+        if self._original_edit is not None:
+            result = await self._original_edit(chat_id, message_id, content, *args, **kwargs)
+        self._notify(chat_id, content)
+        return result
+
+    def _notify(self, chat_id, content):
+        for watcher in tuple(self._watchers):
+            try:
+                watcher.observe(chat_id, content)
+            except Exception:
+                logger.exception('Live Voice: a watcher failed to observe a send')
+
+    @property
+    def original(self):
+        return self._original_send
+
+    def add(self, watcher):
+        self._watchers.add(watcher)
+
+    def discard(self, watcher):
+        self._watchers.discard(watcher)
+
+
+def router_for(adapter):
+    """The adapter's single send observer, installed on first use."""
+    router = getattr(adapter, _ROUTER_ATTR, None)
+    if not isinstance(router, SendRouter):
+        router = SendRouter(adapter)
+        setattr(adapter, _ROUTER_ATTR, router)
+    return router
+
+
 class ChatWork:
     """Runs a delegated request in its own thread under the chat the call came from.
 
@@ -144,32 +206,13 @@ class ChatWork:
         self.event_factory = event_factory or core_message_event
         self.threads = {}
         self.outcome = None
-        self._sent = None
-        self._edited = None
         self._chat = self.chat_id
         self._parts = []
 
-    async def _capture(self, chat_id, content, *args, **kwargs):
-        """Observe the answer AND deliver it.
-
-        The gateway's delivery path uses the value ``send`` returns (a SendResult); an
-        observer that swallows it makes the turn die with
-        "'NoneType' object has no attribute 'success'" and the answer never reaches the
-        chat at all.
-        """
-        result = await self._sent(chat_id, content, *args, **kwargs)
+    def observe(self, chat_id, content):
+        """Called by the adapter's send observer; never sends anything itself."""
         if str(chat_id) == self._chat and isinstance(content, str) and content.strip():
             self._parts.append(content.strip())
-        return result
-
-    async def _capture_edit(self, chat_id, message_id, content=None, *args, **kwargs):
-        # edit_message(chat_id, message_id, content) -- content is the third argument.
-        result = None
-        if self._edited is not None:
-            result = await self._edited(chat_id, message_id, content, *args, **kwargs)
-        if str(chat_id) == self._chat and isinstance(content, str) and content.strip():
-            self._parts.append(content.strip())
-        return result
 
     async def _seed(self, chat_id, text):
         """Show the caller what was asked, so the thread reads on its own."""
@@ -287,12 +330,9 @@ class ChatWork:
                              thread_id=chat_id, parent_chat_id=self._thread_parent())
         event = self.event_factory(str(text), source)
         session_key = self._session_key(source)
-        send, edit = self.adapter.send, getattr(self.adapter, 'edit_message', None)
-        self._sent, self._edited = send, edit
+        router = router_for(self.adapter)
+        router.add(self)
         self._chat, self._parts, self.outcome = chat_id, [], None
-        self.adapter.send = self._capture
-        if edit is not None:
-            self.adapter.edit_message = self._capture_edit
         completion, release = self._watch_turn(session_key)
         try:
             await self.adapter.handle_message(event)
@@ -301,8 +341,6 @@ class ChatWork:
                 logger.warning('Live Voice: the turn for item=%s reported failure', item_id)
         finally:
             release()
-            self.adapter.send = send
-            if edit is not None:
-                self.adapter.edit_message = edit
+            router.discard(self)
         joined = '\n\n'.join(self._parts).strip()
         return joined or FAILED_TEXT

@@ -38,6 +38,44 @@ def owner_home(adapter):
     return Path(get_profile_dir(profile)).resolve()
 
 
+# Discord answers a create with the payload it received and a read with the
+# applied defaults (``integration_types`` comes back as ``[0, 1]``). The two
+# representations never compare equal, so ownership is decided on the fields
+# this plugin actually specified.
+_SERVER_ASSIGNED = ('id', 'version', 'application_id', 'guild_id')
+
+
+def specified_fields(payload):
+    """Project a command payload onto caller-specified fields.
+
+    ``None`` and empty mappings mean "not set" in Discord's application-command
+    API: a create echoes them back, a read reports the applied default, so they
+    carry no ownership meaning and are dropped on both sides.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    result = {}
+    for key, value in payload.items():
+        if key in _SERVER_ASSIGNED or value is None:
+            continue
+        if isinstance(value, dict) and not value:
+            continue
+        if key == 'options' and isinstance(value, list):
+            result[key] = [specified_fields(option) for option in value]
+            continue
+        result[key] = value
+    return result
+
+
+def registration_matches(registered, observed):
+    """True when every field of ``registered`` survived into ``observed``."""
+    sent = specified_fields(registered)
+    seen = specified_fields(observed)
+    if not isinstance(sent, dict) or not isinstance(seen, dict):
+        return sent == seen
+    return all(seen.get(key) == value for key, value in sent.items())
+
+
 REGISTRATION_TIMEOUT = 60.0
 
 
@@ -255,7 +293,14 @@ class NativeHandle:
             created = await asyncio.wait_for(http.upsert_global_command(app_id, payload), 30)
             self.remote = (app_id, dict(created))
             verified = await asyncio.wait_for(http.get_global_commands(app_id), 30)
-            if not any(c == created for c in verified):
+            # Verify the exact command Discord reports back, on the fields we
+            # specified: a create echo and a read never match verbatim.
+            created_id = str(created.get('id') or '')
+            observed = next((c for c in verified
+                             if created_id and str(c.get('id') or '') == created_id), None)
+            if observed is None:
+                observed = next((c for c in verified if registration_matches(payload, c)), None)
+            if observed is None or not registration_matches(payload, observed):
                 raise RuntimeError('Remote command registration unverified.')
             self.synced = not self.closed
             self.sync_status = 'verified'
@@ -280,13 +325,14 @@ class NativeHandle:
             self.sync_status = 'local command replaced: remote not deleted'
             return
         app_id, owned = self.remote
-        # Never delete by name: exact application, ID and returned version/payload.
+        # Never delete by name: exact application and ID, and only while the
+        # command still carries the fields we registered.
         existing = await self.native.http.get_global_commands(app_id)
         current = next((c for c in existing if str(c['id']) == str(owned['id'])), None)
         if current is None:
             self.remote = None
             return
-        if current != owned:
+        if not registration_matches(owned, current):
             self.sync_status = 'remote replaced: not deleted'
             return
         await self.native.http.delete_global_command(app_id, int(owned['id']))

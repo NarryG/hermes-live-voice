@@ -15,6 +15,9 @@ from .broker import V3_VOICES
 
 logger = logging.getLogger(__name__)
 
+# Any single voice action must answer within this, or the caller is told it stalled.
+COMMAND_TIMEOUT = 75.0
+
 # Every boot states which copy of the plugin is live. Deploys silently looked like
 # no-ops when the loader picked a stale same-id directory, and nothing said so.
 logger.warning('Live Voice: native lane module loaded from %s', __file__)
@@ -415,7 +418,8 @@ class NativeHandle:
                 logging.getLogger(__name__).warning('Live Voice cleanup remains pending; ownership retained. Retry cleanup on this handle; operator reconciliation may be required.')
 
 
-async def respond_to_command(interaction, operation, manager, *, logger=logger):
+async def respond_to_command(interaction, operation, manager, *, logger=logger,
+                             timeout=COMMAND_TIMEOUT):
     """Acknowledge Discord's interaction first, then answer with the outcome.
 
     Discord expires an unacknowledged interaction after three seconds and shows
@@ -431,7 +435,13 @@ async def respond_to_command(interaction, operation, manager, *, logger=logger):
         logger.warning('Live Voice: could not acknowledge /livevoice %s (likely expired)', operation,
                        exc_info=True)
     try:
-        message = await manager.command(interaction, operation)
+        # Bounded: a stuck lane must report, not sit on "thinking..." forever. One tap of
+        # /livevoice once hung the whole command with no error and no log line at all.
+        message = await asyncio.wait_for(manager.command(interaction, operation), timeout)
+    except asyncio.TimeoutError:
+        logger.warning('Live Voice: /livevoice %s did not finish within %.0fs', operation, timeout)
+        message = ('That voice action did not finish in time. Try /livevoice stop, then start again. '
+                   'If it keeps happening, Buffer needs a restart.')
     except Exception:
         logger.warning('Live Voice: /livevoice %s raised', operation, exc_info=True)
         message = 'Voice operation failed; status is unknown. No upstream details are disclosed.'

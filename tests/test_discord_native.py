@@ -520,3 +520,18 @@ def test_the_lane_command_is_still_registered_by_the_handle():
     source = inspect.getsource(native_module)
     line = next(l for l in source.splitlines() if 'self.command = app_commands.Command(name=' in l)
     assert line.startswith('        '), 'registration must stay inside the handle setup: %r' % line
+
+
+def test_a_stuck_voice_action_reports_instead_of_hanging():
+    import asyncio
+
+    from discord_voice.native import COMMAND_TIMEOUT, respond_to_command
+
+    class Manager:
+        async def command(self, interaction, operation):
+            await asyncio.sleep(30)   # never finishes
+
+    interaction = _Interaction()
+    message = asyncio.run(respond_to_command(interaction, 'start', Manager(), timeout=.1))
+    assert 'did not finish in time' in message
+    assert interaction.followup.sent == [message]

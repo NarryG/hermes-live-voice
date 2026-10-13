@@ -99,6 +99,21 @@ class PCMTrack(AudioStreamTrack):
     async def append(self, pcm):
         if not isinstance(pcm, bytes) or len(pcm) % 2 or len(pcm) > 480000:
             raise MediaRefused('invalid PCM24 mono input')
+        # The track can only send what it is handed: measure the feed itself, so a starved
+        # ingress is distinguishable from a starved sender. Counters are optional here --
+        # observation must never be able to break the audio path.
+        try:
+            now = asyncio.get_running_loop().time()
+            last = getattr(self, 'ingress_last', None)
+            if last is not None:
+                gap = now - last
+                self.ingress_gap = max(getattr(self, 'ingress_gap', 0.0), gap)
+                if gap > .08:
+                    self.ingress_droughts = getattr(self, 'ingress_droughts', 0) + 1
+            self.ingress_last = now
+            self.ingress_bytes = getattr(self, 'ingress_bytes', 0) + len(pcm)
+        except Exception:
+            pass
         async with self.lock:
             self.pending += pcm
             self.last_audio = asyncio.get_running_loop().time()
@@ -186,6 +201,10 @@ class MediaLane:
         self._session_id = None
         self._delegations = None
         self._append_lock = None
+        self.ingress_bytes = 0
+        self.ingress_last = None
+        self.ingress_gap = 0.0
+        self.ingress_droughts = 0
         self._started = False
         self._remote_audio = False
         self._closed = False
@@ -247,11 +266,14 @@ class MediaLane:
                     continue
                 counters = self._track.stats()
                 logger.warning('Live Voice audio: frames=%d underruns=%d dropouts=%d late_rebases=%d '
-                               'max_queue=%d queued_bytes=%d buffered=%s ready=%s',
+                               'max_queue=%d queued_bytes=%d buffered=%s ready=%s '
+                               'in_bytes=%d in_maxgap=%.2f in_droughts=%d',
                                counters['frames'], counters['underruns'], counters['dropouts'],
                                counters['late_rebases'], counters['max_queue'],
                                counters['queued_bytes'],
-                               getattr(self.channel, 'bufferedAmount', None), self.ready)
+                               getattr(self.channel, 'bufferedAmount', None), self.ready,
+                               getattr(self, 'ingress_bytes', 0), getattr(self, 'ingress_gap', 0.0),
+                               getattr(self, 'ingress_droughts', 0))
         except asyncio.CancelledError:
             raise
         except Exception:

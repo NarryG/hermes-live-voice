@@ -49,10 +49,7 @@ class Session:
         self.incoming = queue.Queue(maxsize=256)  # 16 speakers, bounded UDP handoff
         self.loop = asyncio.get_running_loop()
         self.authority_context = contextvars.copy_context()
-        self.consent_epoch = 1
         self.audience = frozenset(m.id for m in channel.members if m.id != manager.native.user.id)
-        self.consents = {self.binding.owner: (self.binding, self.consent_epoch)}  # /start explicitly opts owner in
-        self.disclosures = {}
         self.suspending = False
         self.reserved = True
 
@@ -93,9 +90,14 @@ class Session:
             return False
         return True
 
-    def consent_ready(self):
+    def admitted(self):
+        """Joining the private channel admits a participant: there is no opt-in step.
+
+        A single /livevoice start is the owner's consent and the audience check is
+        membership, permissions and profile admission only.
+        """
         try:
-            return self.environment() and all(self.consents.get(uid) == (self.binding, self.consent_epoch) for uid in self.audience)
+            return self.environment()
         except Exception:
             return False
 
@@ -113,7 +115,7 @@ class Session:
         if getattr(self.manager.lane_factory, 'media_current', True) is not True:
             self.revoke()
             return False
-        if not self.consent_ready():
+        if not self.admitted():
             self.invalidate()
             return False
         return True
@@ -125,9 +127,6 @@ class Session:
         if not self.suspending:
             self.suspending = True
             self.state = 'waiting'
-            self.consent_epoch += 1
-            self.consents.clear()
-            self.disclosures.clear()
             self.drain()
             self.loop.call_soon_threadsafe(self.manager.schedule_suspend, self)
 
@@ -265,7 +264,6 @@ class SessionManager:
         self.lock = asyncio.Lock()
         self.cleanup_tasks = set()
         self.closed = threading.Event()
-        self.start_disclosure = None  # at most one pending confirmation per adapter
         self.scope: AdapterScope | None = None  # Captured at native registration.
         self.scope_guard: Callable[[], bool] | None = None
 
@@ -286,14 +284,6 @@ class SessionManager:
             return not callable(voice_check) or voice_check(self.voice) is True
         except Exception:
             return False
-
-    def disclosure(self, audience, operation):
-        processing = getattr(self.lane_factory, 'processing_disclosure', None)
-        if not isinstance(processing, str) or not processing.strip():
-            return None
-        people = ', '.join('<@' + str(uid) + '>' for uid in sorted(audience))
-        return (processing + ' Call audience: ' + people + '. Everyone hears replies; admitted participant audio is processed by this lane. '
-                'No private task context is attached. To opt in, repeat /livevoice ' + operation + ' within 60 seconds for this unchanged audience.')
 
     def authorized(self, interaction):
         if self.scope_guard is not None and not self.scope_guard():
@@ -413,17 +403,7 @@ class SessionManager:
                     session.suspending = False
                 if not session.environment():
                     return 'Call audience or participant admission is unavailable; consent was not recorded.'
-                message = self.disclosure(session.audience, 'consent')
-                if message is None:
-                    return 'Provider processing disclosure unavailable; consent was not recorded.'
-                key = (session.binding, session.consent_epoch, session.audience)
-                previous = session.disclosures.get(interaction.user.id)
-                if previous is None or previous[0] != key or time.monotonic() - previous[1] > 60:
-                    session.disclosures[interaction.user.id] = (key, time.monotonic())
-                    return message
-                session.disclosures.pop(interaction.user.id)
-                session.consents[interaction.user.id] = (session.binding, session.consent_epoch)
-                return 'Consent recorded for this call and audience only.'
+                return 'Consent is recorded by joining this call; no separate opt-in step is required.'
             if session and (session.binding.owner != interaction.user.id or session.binding.text != interaction.channel_id or session.binding.profile != profile):
                 return 'Only the call owner in the original text channel can control this voice session.'
             if operation == 'status':
@@ -443,8 +423,8 @@ class SessionManager:
                 await session.deactivate()
                 return 'Voice paused; audio discarded.'
             if operation == 'resume' and session and session.state in ('paused', 'waiting'):
-                if not session.consent_ready():
-                    return 'Every current human participant must consent to this call and audience.'
+                if not session.admitted():
+                    return 'Call audience or participant admission is unavailable; owner must resume.'
                 if not await self.preflight():
                     return self.refusal_message('No provider was started.')
                 if self.closed.is_set():
@@ -467,15 +447,6 @@ class SessionManager:
             audience = frozenset(m.id for m in channel.members if m.id != self.native.user.id)
             if not audience or len(audience) > 16 or any(type(uid) is not int or uid <= 0 for uid in audience):
                 return 'Voice audience unavailable.'
-            message = self.disclosure(audience, 'start')
-            if message is None:
-                return 'Provider processing disclosure unavailable; consent was not recorded.'
-            key = (interaction.user.id, guild_id, channel.id, interaction.channel_id, profile, audience)
-            previous = self.start_disclosure
-            if previous is None or previous[0] != key or time.monotonic() - previous[1] > 60:
-                self.start_disclosure = (key, time.monotonic())
-                return message
-            self.start_disclosure = None
             if not await self.preflight():
                 return self.refusal_message('No Discord connection or provider was started.')
             if self.closed.is_set():
@@ -490,11 +461,7 @@ class SessionManager:
             # and session publication; /start must not consent to a new audience.
             current_audience = frozenset(m.id for m in channel.members if m.id != self.native.user.id)
             if current_audience != audience:
-                message = self.disclosure(current_audience, 'start')
-                if message is None:
-                    return 'Provider processing disclosure unavailable; consent was not recorded.'
-                self.start_disclosure = (key[:-1] + (current_audience,), time.monotonic())
-                return message
+                return 'Voice audience changed; run /livevoice again for the current channel.'
             if not _OVERALL_CAPACITY.acquire(blocking=False):
                 return 'Overall voice session capacity reached.'
             session = None
@@ -505,9 +472,9 @@ class SessionManager:
                     await self.finish(session)
                     return 'Voice requires admitted human participants, no extra bots, and Connect/Speak permissions.'
                 session.vc = await channel.connect()
-                if not session.consent_ready():
+                if not session.admitted():
                     session.state = 'waiting'
-                    return 'Voice waiting for participant consent; owner must resume.'
+                    return 'Voice admission changed while connecting; run /livevoice again.'
                 await session.activate()
                 return 'Voice started.'
             except BaseException as error:

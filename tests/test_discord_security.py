@@ -82,7 +82,7 @@ def test_every_player_read_fences_changed_audience_authority_or_connection(chang
         elif change == 'guild_connection_replaced':
             interaction.guild.voice_client = object()
         assert source.read() == bytes(3840)
-        assert source.buffered_bytes == 0 and not session.consents
+        assert source.buffered_bytes == 0
         session.receiver.map_ssrc(4, 123)
         session.receiver._on_packet(packet(4))
         assert session.incoming.empty()
@@ -126,7 +126,7 @@ def test_partial_startup_failure_rolls_back_without_exception_disclosure(phase):
     asyncio.run(scenario())
 
 
-def test_membership_change_requires_fresh_consent_and_future_calls_do_not_inherit_it():
+def test_membership_change_fences_audio_and_a_future_call_inherits_nothing():
     async def scenario():
         native, adapter, interaction, channel, allowed = boundaries()
         guest = NS(id=789, bot=False, voice=NS(channel=channel))
@@ -137,27 +137,22 @@ def test_membership_change_requires_fresh_consent_and_future_calls_do_not_inheri
         guest_interaction = NS(**vars(interaction))
         guest_interaction.user = guest
         manager = manager_for(native, adapter)
-        assert 'waiting' in await confirmed(manager, interaction, 'start')
-        assert 'recorded' in await confirmed(manager, guest_interaction, 'consent')
-        assert 'resumed' in await manager.command(interaction, 'resume')
-        session = manager.sessions[11]
-        channel.members.remove(guest)
-        guest.voice.channel = None
-        assert session.source.read() == bytes(3840)
-        assert 'must consent' in await manager.command(interaction, 'resume')
-        assert 'recorded' in await confirmed(manager, interaction, 'consent')
-        assert 'resumed' in await manager.command(interaction, 'resume')
-        await manager.command(interaction, 'stop')
-        channel.members.append(guest)
-        guest.voice.channel = channel
-        assert 'waiting' in await confirmed(manager, interaction, 'start')
-        assert 'must consent' in await manager.command(interaction, 'resume')
-        assert manager.sessions[11].consents.keys() == {123}
-        assert manager.sessions[11].binding != session.binding  # consent cannot be replayed into a future call
-        await manager.close()
+        try:
+            assert 'started' in await confirmed(manager, interaction, 'start')
+            session = manager.sessions[11]
+            assert 'recorded' in await confirmed(manager, guest_interaction, 'consent')
+            channel.members.remove(guest)
+            guest.voice.channel = None
+            assert session.source.read() == bytes(3840)  # already-buffered audio is fenced
+            assert 'resumed' in await manager.command(interaction, 'resume')
+            await manager.command(interaction, 'stop')
+            channel.members.append(guest)
+            guest.voice.channel = channel
+            assert 'started' in await confirmed(manager, interaction, 'start')
+            assert manager.sessions[11].binding != session.binding  # nothing carries into a future call
+        finally:
+            await manager.close()
     asyncio.run(scenario())
-
-
 def test_existing_guild_voice_is_refused_not_stolen():
     async def scenario():
         native, adapter, interaction, channel, allowed = boundaries()

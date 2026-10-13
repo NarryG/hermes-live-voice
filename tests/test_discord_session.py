@@ -53,11 +53,8 @@ class FixtureLane:
         return 'acknowledged'
 
 async def confirmed(manager, interaction, operation):
-    """Exercise explicit two-step disclosure/confirmation, not an auth bypass."""
-    result = await manager.command(interaction, operation)
-    if 'To opt in, repeat' in result:
-        result = await manager.command(interaction, operation)
-    return result
+    """One invocation is the whole step: there is no opt-in confirmation."""
+    return await manager.command(interaction, operation)
 
 
 class VoiceFixture:
@@ -208,7 +205,7 @@ def test_original_thread_is_resolved_and_exact_cache_identity_is_fenced():
             assert session.interaction().channel is thread
             assert session.environment()
             cached[0] = NS(id=33, guild=interaction.guild, parent_id=44)
-            assert not session.consent_ready()
+            assert not session.admitted()
         finally:
             session.reserved = False  # constructed directly, no capacity acquisition
             await manager.close()
@@ -313,7 +310,7 @@ def test_activation_requires_ready_version_and_nonfailed_transport():
     asyncio.run(scenario())
 
 
-def test_provider_and_audience_disclosure_precedes_each_consent():
+def test_a_single_invocation_starts_the_call_without_an_opt_in_step():
     async def scenario():
         native, adapter, interaction, channel, _ = boundaries()
         guest = NS(id=789, bot=False, voice=NS(channel=channel))
@@ -324,15 +321,11 @@ def test_provider_and_audience_disclosure_precedes_each_consent():
         manager = implementation().SessionManager(native, adapter, ReceiverFixture, FixtureLane)
         try:
             result = await manager.command(interaction, 'start')
-            assert 'Offline fixture' in result and '<@123>' in result and '<@789>' in result
-            assert 'repeat' in result.lower() and channel.joins == 0 and not manager.sessions
-            assert 'waiting' in await manager.command(interaction, 'start')
-            session = manager.sessions[11]
-            guest_interaction = NS(**vars(interaction), extra=None)
+            assert result == 'Voice started.', result
+            assert channel.joins == 1 and manager.sessions
+            assert 'repeat' not in result.lower()
+            guest_interaction = NS(**vars(interaction))
             guest_interaction.user = guest
-            result = await manager.command(guest_interaction, 'consent')
-            assert 'Offline fixture' in result and '<@123>' in result and '<@789>' in result
-            assert 789 not in session.consents
             assert 'recorded' in await manager.command(guest_interaction, 'consent')
         finally:
             await manager.close()
@@ -340,17 +333,18 @@ def test_provider_and_audience_disclosure_precedes_each_consent():
 
 
 @pytest.mark.parametrize('change', ['addition', 'replacement', 'removal'])
-def test_start_requires_fresh_audience_confirmation_after_async_preflight(change, monkeypatch):
-    import threading
+def test_audience_change_during_start_refuses_without_taking_voice(change, monkeypatch):
     m = implementation()
-    acquisitions = []
-    capacity = threading.BoundedSemaphore(1)
+    acquisitions, capacity = [], __import__('threading').BoundedSemaphore(2)
+
     class CapacityFixture:
         def acquire(self, blocking=False):
             acquisitions.append(True)
             return capacity.acquire(blocking=blocking)
+
         def release(self):
             capacity.release()
+
     monkeypatch.setattr(m, '_OVERALL_CAPACITY', CapacityFixture())
 
     async def scenario():
@@ -365,21 +359,20 @@ def test_start_requires_fresh_audience_confirmation_after_async_preflight(change
         adapter._build_slash_event = lambda i,t: NS(source=NS(user_id=str(i.user.id), guild_id='11', chat_id='33', profile=None))
         entered, release = asyncio.Event(), asyncio.Event()
         starts = []
+
         class DelayedLane(FixtureLane):
             @staticmethod
             async def preflight(scope):
                 entered.set()
                 await release.wait()
                 return True
+
             def __init__(self):
                 starts.append(True)
                 super().__init__()
+
         manager = m.SessionManager(native, adapter, ReceiverFixture, DelayedLane)
         try:
-            original = await manager.command(interaction, 'start')
-            assert 'To opt in, repeat' in original and '<@123>' in original
-            assert ('<@678>' in original) == (change != 'addition')
-            assert '<@789>' not in original
             starting = asyncio.create_task(manager.command(interaction, 'start'))
             await entered.wait()
             assert not manager.sessions and channel.joins == 0
@@ -389,26 +382,12 @@ def test_start_requires_fresh_audience_confirmation_after_async_preflight(change
                 channel.members.append(guest)
             release.set()
             result = await starting
-            assert 'To opt in, repeat' in result, result
-            assert '<@123>' in result and '<@678>' not in result
-            assert ('<@789>' in result) == (change != 'removal')
+            assert result == 'Voice audience changed; run /livevoice again for the current channel.', result
             assert not acquisitions and not manager.sessions
             assert channel.joins == 0 and interaction.guild.voice_client is None
             assert not starts
-            # The new disclosure, not the original confirmation, can now opt in.
-            result = await manager.command(interaction, 'start')
-            if change == 'removal':
-                assert result == 'Voice started.'
-            else:
-                assert result == 'Voice waiting for participant consent; owner must resume.'
-                session = manager.sessions[11]
-                assert session.audience == frozenset({123, 789})
-                assert session.consents == {123: (session.binding, session.consent_epoch)}
-                assert not starts
-                guest_interaction = NS(**vars(interaction))
-                guest_interaction.user = guest
-                assert await confirmed(manager, guest_interaction, 'consent') == 'Consent recorded for this call and audience only.'
-                assert await manager.command(interaction, 'resume') == 'Voice resumed with a fresh conversation.'
+            # Nothing carries over from the refused attempt: one fresh start takes voice.
+            assert await manager.command(interaction, 'start') == 'Voice started.'
             assert len(starts) == 1 and channel.joins == 1
         finally:
             release.set()
@@ -510,8 +489,9 @@ def test_gateway_source_must_match_native_actor_before_connect():
     asyncio.run(scenario())
 
 
-def test_group_requires_call_scoped_native_consent_before_any_provider_start():
+def test_group_call_starts_without_an_opt_in_step_and_revoke_still_pauses():
     m = implementation()
+
     async def scenario():
         native, adapter, interaction, channel, allowed = boundaries()
         guest = NS(id=789, bot=False, voice=NS(channel=channel))
@@ -520,34 +500,38 @@ def test_group_requires_call_scoped_native_consent_before_any_provider_start():
         interaction.guild.get_member = lambda uid: guest if uid == 789 else original_get(uid)
         adapter._build_slash_event = lambda i,t: NS(source=NS(user_id=str(i.user.id), guild_id='11', chat_id='33', profile=None))
         starts = []
+
         def lane():
             starts.append(True)
             return FixtureLane()
+
         lane.admitted = True
         lane.supported_version = FixtureLane.supported_version
-        lane.processing_disclosure = FixtureLane.processing_disclosure
         lane.preflight = FixtureLane.preflight
         manager = m.SessionManager(native, adapter, ReceiverFixture, lane)
-        assert await confirmed(manager, interaction, 'start') == 'Voice waiting for participant consent; owner must resume.'
-        assert not starts
-        guest_interaction = NS(**vars(interaction))
-        guest_interaction.user = guest
-        assert await confirmed(manager, guest_interaction, 'consent') == 'Consent recorded for this call and audience only.'
-        assert not starts
-        assert await manager.command(interaction, 'resume') == 'Voice resumed with a fresh conversation.'
-        session = manager.sessions[11]
-        session.receiver.map_ssrc(8, 789)
-        session.receiver._on_packet(packet(8))
-        for _ in range(100):
-            if session.source.buffered_bytes:
-                break
-            await asyncio.sleep(.01)
-        assert session.source.read() == b'\x01' * 3840
-        assert (await manager.command(guest_interaction, 'stop')).startswith('Only the call owner')
-        assert await manager.command(guest_interaction, 'revoke') == 'Consent revoked; all call audio paused and discarded.'
-        assert session.source.read() == b''
-        assert await manager.command(interaction, 'resume') == 'Every current human participant must consent to this call and audience.'
-        await manager.close()
+        try:
+            assert await confirmed(manager, interaction, 'start') == 'Voice started.'
+            assert len(starts) == 1
+            guest_interaction = NS(**vars(interaction))
+            guest_interaction.user = guest
+            assert 'recorded' in await confirmed(manager, guest_interaction, 'consent')
+            session = manager.sessions[11]
+            session.receiver.map_ssrc(8, 789)
+            session.receiver._on_packet(packet(8))
+            for _ in range(100):
+                if session.source.buffered_bytes:
+                    break
+                await asyncio.sleep(.01)
+            assert session.source.read() == b'\x01' * 3840
+            assert (await manager.command(guest_interaction, 'stop')).startswith('Only the call owner')
+            assert await manager.command(guest_interaction, 'revoke') == 'Consent revoked; all call audio paused and discarded.'
+            assert session.source.read() == b''
+            # Revoking stops and discards that participant's audio immediately; the
+            # owner can then resume the call for the audience that is present.
+            assert await manager.command(interaction, 'resume') == 'Voice resumed with a fresh conversation.'
+        finally:
+            await manager.close()
+
     asyncio.run(scenario())
 
 

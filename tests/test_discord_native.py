@@ -398,7 +398,6 @@ def test_membership_event_invalidates_consent_without_ending_owner_call(tmp_path
         stranger = NS(id=789, bot=False, guild=interaction.guild)
         await registered['on_voice_state_update'](stranger, NS(channel=None), NS(channel=channel))
         assert session.state == 'waiting'
-        assert not session.consents
         assert session.source.buffered_bytes == 0
         assert session.source.read() == bytes(3840)
         await asyncio.sleep(.05)

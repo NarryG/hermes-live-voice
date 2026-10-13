@@ -88,29 +88,14 @@ def test_native_command_lazy_owner_preflight_and_real_local_http_webrtc(tmp_path
             assert handle.manager.lane_factory.account_ready is False
             if ending == 'voice-mismatch':
                 handle.manager.voice = 'juniper'  # not the CLI-selected cove; must not select it
-            await command.callback(interaction, 'start')
-            assert 'To opt in, repeat' in replies[-1]
-            assert not (cli/'FAKE-REQUESTS.jsonl').exists()
-            assert channel.joins == 0 and not requests
+            guest_interaction = NS(**vars(interaction))
+            guest_interaction.user = guest
             await command.callback(interaction, 'start')
             if ending == 'voice-mismatch':
                 assert 'preflight refused' in replies[-1]
                 assert channel.joins == 0 and not requests and not handle.manager.sessions
                 return
-            if speaker_count == 2:
-                assert replies[-1] == 'Voice waiting for participant consent; owner must resume.'
-                assert not requests
-                guest_interaction = NS(**vars(interaction))
-                guest_interaction.user = guest
-                await command.callback(guest_interaction, 'consent')
-                assert 'To opt in, repeat' in replies[-1]
-                assert not requests
-                await command.callback(guest_interaction, 'consent')
-                assert replies[-1] == 'Consent recorded for this call and audience only.'
-                await command.callback(interaction, 'resume')
-                assert replies[-1] == 'Voice resumed with a fresh conversation.'
-            else:
-                assert replies[-1] == 'Voice started.'
+            assert replies[-1] == 'Voice started.'
             session = handle.manager.sessions[11]
             lane = session.lane
             assert lane.ready and lane.version == 'v3' and lane.failed is False
@@ -145,7 +130,7 @@ def test_native_command_lazy_owner_preflight_and_real_local_http_webrtc(tmp_path
             elif speaker_count == 2:
                 await command.callback(guest_interaction, 'revoke')
                 assert replies[-1] == 'Consent revoked; all call audio paused and discarded.'
-                assert not session.consents and session.source.read() == b''
+                assert session.source.read() == b''
             else:
                 await command.callback(interaction, 'pause')
                 assert replies[-1] == 'Voice paused; audio discarded.'

@@ -7,8 +7,7 @@ from typing import Optional
 
 import pytest
 
-from discord_voice.delegation import (FAILED_TEXT, TIMEOUT_TEXT, DelegationQueue,
-                                      speakable)
+from discord_voice.delegation import (FAILED_TEXT, TIMEOUT_TEXT, TaskBoard, speakable)
 
 
 def _run(coro):
@@ -37,7 +36,7 @@ def test_a_delegated_request_comes_back_to_the_call():
         reported.append((item_id, text))
 
     async def main():
-        queue = DelegationQueue(run, report).start()
+        queue = TaskBoard(run, report).start()
         assert queue.submit('item-1', 'do the thing') is True
         for _ in range(100):
             if reported:
@@ -60,7 +59,7 @@ def test_a_failing_task_reports_something_usable():
         reported.append(text)
 
     async def main():
-        queue = DelegationQueue(run, report).start()
+        queue = TaskBoard(run, report).start()
         queue.submit('item-2', 'x')
         for _ in range(100):
             if reported:
@@ -82,7 +81,7 @@ def test_a_task_that_outruns_the_call_reports_and_frees_the_queue():
         reported.append(text)
 
     async def main():
-        queue = DelegationQueue(run, report, timeout=.05).start()
+        queue = TaskBoard(run, report, timeout=.05).start()
         queue.submit('item-3', 'slow')
         for _ in range(120):
             if reported:
@@ -101,10 +100,14 @@ def test_a_full_queue_is_refused_not_silently_dropped():
     async def report(item_id, text):
         pass
 
-    queue = DelegationQueue(run, report, capacity=2)
-    assert queue.submit('a', 'x') is True
-    assert queue.submit('b', 'x') is True
-    assert queue.submit('c', 'x') is False
+    async def main():
+        board = TaskBoard(run, report, capacity=2).start()
+        assert board.submit('a', 'x') is True
+        assert board.submit('b', 'x') is True
+        assert board.submit('c', 'x') is False   # at capacity: refused, never dropped quietly
+        await board.stop()
+
+    _run(main())
 
 
 def test_a_stopped_queue_accepts_nothing():
@@ -115,7 +118,7 @@ def test_a_stopped_queue_accepts_nothing():
         pass
 
     async def main():
-        queue = DelegationQueue(run, report).start()
+        queue = TaskBoard(run, report).start()
         await queue.stop()
         assert queue.submit('late', 'x') is False
 
@@ -207,11 +210,17 @@ def test_the_seed_never_leaks_into_the_answer():
     assert any('do a thing' in content for chat, content in adapter.sends if chat == '999')
 
 
-def test_a_call_already_in_a_thread_runs_in_place():
-    adapter = _CoreAdapter()
+def test_a_call_in_a_thread_with_nowhere_to_open_one_runs_in_place():
+    """Discord refuses children of a thread; with no parent channel we use the call chat."""
+    class Refusing(_CoreAdapter):
+        async def create_handoff_thread(self, parent_chat_id, name):
+            self.thread_requests.append((parent_chat_id, name))
+            return None
+
+    adapter = Refusing()
     work = _work(adapter, _Source(chat_type='thread', chat_id='777'), '777')
     answer = _run(work('do a thing', 'item-9'))
-    assert adapter.thread_requests == []
+    assert adapter.thread_requests and adapter.thread_requests[0][0] == '777'
     assert adapter.dispatched == ['777']
     assert answer == 'the answer'
 
@@ -305,3 +314,106 @@ def test_a_turn_without_the_hook_reports_what_it_captured():
     del adapter.on_processing_complete
     work = _work(adapter, _Source(), '555')
     assert _run(work('do a thing', 'item-19')) == 'the answer'
+
+
+def test_several_tasks_run_at_once_not_one_behind_another():
+    """A call must be able to hand over more than one thing and get on with it."""
+    import time
+
+    async def run(text, item_id=None):
+        await asyncio.sleep(.25)
+        return 'done ' + item_id
+
+    async def report(item_id, text):
+        pass
+
+    async def main():
+        board = TaskBoard(run, report, capacity=4).start()
+        started = time.monotonic()
+        assert board.submit('a', 'one') is True
+        assert board.submit('b', 'two') is True
+        assert board.submit('c', 'three') is True
+        assert len(board.inflight) == 3
+        while board.inflight:
+            await asyncio.sleep(.02)
+        elapsed = time.monotonic() - started
+        await board.stop()
+        return elapsed
+
+    elapsed = _run(main())
+    assert elapsed < .6, elapsed  # serial would be ~.75
+
+
+def test_each_task_is_reported_when_it_finishes():
+    reported = []
+
+    async def run(text, item_id=None):
+        await asyncio.sleep(.3 if item_id == 'slow' else .02)
+        return 'answer for ' + item_id
+
+    async def report(item_id, text):
+        reported.append((item_id, text))
+
+    async def main():
+        board = TaskBoard(run, report, capacity=4).start()
+        board.submit('slow', 'x')
+        board.submit('quick', 'y')
+        for _ in range(200):
+            if len(reported) == 2:
+                break
+            await asyncio.sleep(.01)
+        await board.stop()
+
+    _run(main())
+    assert [item for item, _ in reported] == ['quick', 'slow']  # as they finish, not in order
+    assert dict(reported)['slow'] == 'answer for slow'
+
+
+def test_capacity_counts_tasks_in_flight():
+    async def run(text, item_id=None):
+        await asyncio.sleep(.2)
+        return 'x'
+
+    async def report(item_id, text):
+        pass
+
+    async def main():
+        board = TaskBoard(run, report, capacity=2).start()
+        assert board.submit('a', 'x') is True
+        assert board.submit('b', 'x') is True
+        assert board.submit('c', 'x') is False      # at capacity
+        while board.inflight:
+            await asyncio.sleep(.02)
+        assert board.submit('d', 'x') is True       # room again
+        await board.stop()
+
+    _run(main())
+
+
+def test_stopping_cancels_every_task_in_flight():
+    async def run(text, item_id=None):
+        await asyncio.sleep(30)
+
+    async def report(item_id, text):
+        pass
+
+    async def main():
+        board = TaskBoard(run, report).start()
+        board.submit('a', 'x')
+        board.submit('b', 'x')
+        await board.stop()
+        assert board.inflight == {}
+        assert board.submit('c', 'x') is False
+
+    _run(main())
+
+
+def test_a_call_inside_a_thread_opens_task_threads_in_the_parent_channel():
+    """A thread cannot host a thread, and sharing one session aborts turns."""
+    adapter = _CoreAdapter()
+    source = _Source(chat_type='thread', chat_id='777', parent_chat_id='555')
+    work = _work(adapter, source, '777')
+    answer = _run(work('do a thing', 'item-20'))
+    assert adapter.thread_requests and adapter.thread_requests[0][0] == '555'
+    assert adapter.dispatched == ['999']
+    assert answer == 'the answer'

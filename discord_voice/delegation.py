@@ -36,69 +36,77 @@ def speakable(text, limit=SPEAKABLE_CHARS):
     return cut.rstrip(' ,.;:') + ' ...'
 
 
-class DelegationQueue:
-    """One delegated request at a time; results are appended to the call in order."""
+class TaskBoard:
+    """Dispatches delegated work in parallel and reports each task as it finishes.
+
+    A call can hand over several things at once; each runs in its own thread, so each has
+    its own session and they cannot interrupt one another (the gateway leases a session
+    to one turn at a time -- sharing a session is what aborted a delegated turn and left
+    the call waiting for an answer that could never arrive).
+
+    ``run(text, item_id)`` executes one request, ``report(item_id, text)`` hands its
+    answer back to the call. Capacity is the number of tasks in flight at once; beyond it
+    a request is refused rather than silently dropped.
+    """
 
     def __init__(self, run, report, *, capacity=CAPACITY, timeout=TIMEOUT_S):
         self._run = run
         self._report = report
-        self._capacity = capacity
+        self._capacity = max(1, int(capacity))
         self._timeout = timeout
-        self._queue = asyncio.Queue(maxsize=capacity)
-        self._worker = None
+        self._inflight = {}
         self._closed = False
 
     @property
-    def pending(self):
-        return self._queue.qsize()
+    def inflight(self):
+        return dict(self._inflight)
 
     @property
     def closed(self):
         return self._closed
 
     def start(self):
-        if self._worker is None:
-            self._worker = asyncio.create_task(self._serve())
         return self
 
     def submit(self, item_id, text):
-        """Queue one request; False when the queue is full or the call is closing."""
-        if self._closed or self._queue.full():
+        """Dispatch one request; False when at capacity or the call is closing."""
+        if self._closed or len(self._inflight) >= self._capacity:
             return False
-        self._queue.put_nowait((str(item_id), str(text or '').strip()))
-        logger.warning('Live Voice: delegation queued item=%s depth=%d', item_id, self._queue.qsize())
+        item_id = str(item_id)
+        task = asyncio.create_task(self._serve(item_id, str(text or '').strip()))
+        self._inflight[item_id] = task
+        task.add_done_callback(lambda _t, i=item_id: self._inflight.pop(i, None))
+        logger.warning('Live Voice: task dispatched item=%s inflight=%d', item_id, len(self._inflight))
         return True
 
     async def stop(self):
         self._closed = True
-        if self._worker is not None:
-            worker, self._worker = self._worker, None
-            worker.cancel()
+        tasks = list(self._inflight.values())
+        self._inflight.clear()
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
             try:
-                await worker
+                await task
             except (asyncio.CancelledError, Exception):
                 pass
 
-    async def _serve(self):
-        while True:
-            item_id, text = await self._queue.get()
-            answer = FAILED_TEXT
-            try:
-                logger.warning('Live Voice: delegation started item=%s', item_id)
-                result = await asyncio.wait_for(self._run(text, item_id), self._timeout)
-                answer = speakable(result) or FAILED_TEXT
-            except asyncio.TimeoutError:
-                answer = TIMEOUT_TEXT
-                logger.warning('Live Voice: delegation timed out item=%s', item_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception('Live Voice: delegated task failed item=%s', item_id)
-            try:
-                await self._report(item_id, answer)
-                logger.warning('Live Voice: delegation reported item=%s chars=%d', item_id, len(answer))
-            except Exception:
-                logger.exception('Live Voice: could not append delegation result item=%s', item_id)
+    async def _serve(self, item_id, text):
+        answer = FAILED_TEXT
+        try:
+            outcome = await asyncio.wait_for(self._run(text, item_id), self._timeout)
+            answer = outcome if isinstance(outcome, str) and outcome.strip() else FAILED_TEXT
+        except asyncio.TimeoutError:
+            answer = TIMEOUT_TEXT
+            logger.warning('Live Voice: task timed out item=%s', item_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception('Live Voice: delegated task failed item=%s', item_id)
+        try:
+            await self._report(item_id, answer)
+        except Exception:
+            logger.exception('Live Voice: could not append delegation result item=%s', item_id)
 
 
 def core_message_event(text, source):
@@ -155,15 +163,26 @@ class ChatWork:
         except Exception:
             logger.warning('Live Voice: could not seed task thread %s', chat_id, exc_info=True)
 
-    async def _thread_for(self, text, item_id):
-        if getattr(self.source, 'chat_type', None) == 'thread':
+    def _thread_parent(self):
+        """Where task threads live: the call's channel, or the channel its thread sits in.
+
+        A Discord thread cannot host a child thread, so a call started inside one still
+        needs the parent channel for per-task threads -- otherwise every task shares the
+        call's own session and they abort each other's turns.
+        """
+        if getattr(self.source, 'chat_type', None) != 'thread':
             return self.chat_id
+        parent = getattr(self.source, 'parent_chat_id', None)
+        return str(parent) if parent else self.chat_id
+
+    async def _thread_for(self, text, item_id):
         create = getattr(self.adapter, 'create_handoff_thread', None)
         if not callable(create):
             return self.chat_id
+        parent = self._thread_parent()
         name = (self.name_prefix + ' '.join(str(text).split()))[:80].strip() or self.name_prefix.strip()
         try:
-            thread_id = await create(self.chat_id, name)
+            thread_id = await create(parent, name)
         except Exception:
             logger.warning('Live Voice: task thread creation failed; using the call chat', exc_info=True)
             return self.chat_id
@@ -244,7 +263,7 @@ class ChatWork:
         source = self.source
         if chat_id != self.chat_id:
             source = replace(self.source, chat_id=chat_id, chat_type='thread',
-                             thread_id=chat_id, parent_chat_id=self.chat_id)
+                             thread_id=chat_id, parent_chat_id=self._thread_parent())
         event = self.event_factory(str(text), source)
         session_key = self._session_key(source)
         send, edit = self.adapter.send, getattr(self.adapter, 'edit_message', None)

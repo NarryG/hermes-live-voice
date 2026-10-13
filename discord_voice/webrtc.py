@@ -163,6 +163,7 @@ class MediaLane:
         self._changed = asyncio.Event()
         self._session_id = None
         self._delegations = None
+        self._append_lock = None
         self._started = False
         self._remote_audio = False
         self._closed = False
@@ -341,6 +342,8 @@ class MediaLane:
     def attach_delegations(self, queue):
         """Give the lane something that can actually run what the call delegates."""
         self._delegations = queue
+        if self._append_lock is None:
+            self._append_lock = asyncio.Lock()
 
     def _delegation_result(self, item_id, text):
         return {'type': 'delegation.context.append', 'delegation_item_id': item_id,
@@ -357,7 +360,9 @@ class MediaLane:
                 if self.channel.readyState != 'open' or self.channel.bufferedAmount > 65536:
                     logger.warning('Live Voice: delegation result not delivered item=%s (backpressure)', item_id)
                     return
-            self.channel.send(json.dumps(self._delegation_result(item_id, text)))
+            # Several tasks can finish at once: append them one at a time.
+            async with (self._append_lock or asyncio.Lock()):
+                self.channel.send(json.dumps(self._delegation_result(item_id, text)))
         except Exception:
             logger.exception('Live Voice: delegation result send failed item=%s', item_id)
 

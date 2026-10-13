@@ -171,7 +171,7 @@ class Session:
     def delegation_queue(self):
         from gateway.session import SessionSource
 
-        from .delegation import ChatWork, DelegationQueue
+        from .delegation import ChatWork, TaskBoard
         b = self.binding
         text = self.text_channel
         parent = getattr(text, 'parent', None)
@@ -188,7 +188,7 @@ class Session:
         work = ChatWork(self.manager.adapter, source, str(b.text))
         logger.warning('Live Voice: delegations run in chat=%s (%s)', b.text,
                        'thread' if is_thread else 'channel')
-        return DelegationQueue(work, self.lane.report_delegation).start()
+        return TaskBoard(work, self.lane.report_delegation).start()
 
     async def activate(self):
         if getattr(self.manager.lane_factory, 'admitted', False) is not True:

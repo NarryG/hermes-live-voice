@@ -3,10 +3,14 @@
 Host decrypt/DAVE/Opus remain unchanged; unknown SSRC is never inferred.
 No references to host receiver/mixer registries are mutated.
 """
+import logging
 import struct
 import threading
 import time
 from typing import NamedTuple
+
+
+logger = logging.getLogger(__name__)
 
 
 class SpeakerPCM(NamedTuple):
@@ -24,6 +28,8 @@ def new_receiver(base, voice_client, owner, guard, deliver):
             self._lock = threading.RLock()
             self._rejected = set()
             self._seen = set()
+            self._drops = 0
+            self._delivered = 0
             self._snapshot = None
             self._installed = None
 
@@ -80,6 +86,11 @@ def new_receiver(base, voice_client, owner, guard, deliver):
             with self._lock:
                 if not self._running or not guard() or self._ssrc_to_user.get(ssrc) not in owners or ssrc in self._rejected:
                     self._buffers.clear()
+                    if self._drops < 10:
+                        self._drops += 1
+                        logger.info('Live Voice rx: dropping ssrc=%s (running=%s guard=%s mapped=%s rejected=%s)',
+                                    ssrc, self._running, bool(guard()),
+                                    self._ssrc_to_user.get(ssrc), ssrc in self._rejected)
                     return
                 super()._on_packet(packet)
                 # Host only buffers one decoded Opus packet before we drain.
@@ -88,6 +99,9 @@ def new_receiver(base, voice_client, owner, guard, deliver):
                 if hasattr(self, '_last_packet_time'):
                     self._last_packet_time.clear()
                 if pcm and len(pcm) <= 23040 and guard():
+                    if self._delivered < 10:
+                        self._delivered += 1
+                        logger.info('Live Voice rx: delivering %d bytes from user=%s', len(pcm), self._ssrc_to_user[ssrc])
                     deliver(SpeakerPCM(self._ssrc_to_user[ssrc], time.monotonic(),
                                        struct.unpack_from('>I', packet, 4)[0], pcm))
 

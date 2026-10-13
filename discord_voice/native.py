@@ -13,6 +13,8 @@ from discord import app_commands
 from .session import SessionManager, AdapterScope
 from .broker import V3_VOICES
 
+logger = logging.getLogger(__name__)
+
 
 def normalize_settings(settings):
     settings = settings if isinstance(settings, dict) else {}
@@ -202,7 +204,12 @@ class NativeHandle:
             try:
                 message = await self.manager.command(interaction, operation)
             except Exception:
+                logger.warning('Live Voice: /livevoice %s raised', operation, exc_info=True)
                 message = 'Voice operation failed; status is unknown. No upstream details are disclosed.'
+            # The reply is the only user-visible outcome; without it a silent lane
+            # and a refusing lane look identical in the logs.
+            logger.info('Live Voice: /livevoice %s by user=%s -> %s', operation,
+                        getattr(getattr(interaction, 'user', None), 'id', '?'), message)
             if self.closed or self.manager.closed.is_set():
                 return
             await interaction.followup.send(message, ephemeral=True)
